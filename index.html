@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#eee9dc" />
+  <title>艺数智策 · 算出艺术怎样才能被看见</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#overview" aria-label="艺数智策首页">
+        <span class="brand-seal">艺</span><span><b>艺数智策</b><small>ARTSMART STRATEGY</small></span>
+      </a>
+      <div class="team-switch"><span class="team-avatar">艺</span><span><b>示例艺术团队</b><small>私有经验库</small></span><span class="chevron">⌄</span></div>
+      <p class="nav-label">内容运营</p>
+      <nav class="nav-list" aria-label="主导航">
+        <button class="nav-item active" data-page="overview"><span>◫</span>运营总览</button>
+        <button class="nav-item" data-page="records"><span>▤</span>内容记录</button>
+        <button class="nav-item" data-page="analysis"><span>⌁</span>效果分析</button>
+        <button class="nav-item" data-page="suggestions"><span>✳</span>排期建议</button>
+        <button class="nav-item" data-page="calendar"><span>▦</span>排期日历</button>
+      </nav>
+      <div class="sidebar-bottom"><div class="privacy-note"><span>◈</span><div><b>只分析你录入的数据</b><small>不抓取外部平台内容</small></div></div><button class="nav-item" data-page="settings"><span>⚙</span>模型接口设置</button><div class="user-card"><div class="user-avatar">知</div><div><b>团队运营者</b><small>本地体验空间</small></div><button id="resetData" title="重置体验数据">↺</button></div></div>
+    </aside>
+    <main class="main-area">
+      <header class="topbar"><button id="menuToggle" class="icon-btn menu-toggle" aria-label="打开菜单">☰</button><div class="breadcrumb">艺数智策 <span>/</span> <b id="crumb">运营总览</b></div><div class="topbar-right"><span class="today-label" id="todayLabel"></span><button class="top-action" data-goto="records">＋ <span>录入内容</span></button></div></header>
+      <div id="pageRoot" class="page-root"></div>
+      <footer class="footer-note"><span>艺数智策</span><i>·</i>算出艺术怎样才能被看见<i>·</i>你的数据，只为你的团队服务</footer>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status"></div>
+  <div id="modalRoot"></div>
+  <script src="app.js"></script>
+</body>
+</html>
