@@ -1,0 +1,12 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+SQLAlchemy==2.0.54
+alembic==1.15.2
+pandas==3.0.6
+python-multipart==0.0.20
+python-dotenv==1.1.0
+httpx==0.28.1
+reportlab==4.4.1
+Pillow==12.3.0
+pytesseract==0.3.13
+psycopg[binary]==3.2.13
