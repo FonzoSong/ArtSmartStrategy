@@ -1,4 +1,18 @@
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: arts_smart
+      POSTGRES_USER: arts_smart
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "arts_smart", "-d", "arts_smart"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
   artsmart:
     build: .
     ports:
@@ -6,7 +20,11 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: sqlite:////app/data/arts_smart.db
-    volumes:
-      - ./data:/app/data
+      DATABASE_URL: postgresql+psycopg://arts_smart:${POSTGRES_PASSWORD}@db:5432/arts_smart
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  postgres-data:

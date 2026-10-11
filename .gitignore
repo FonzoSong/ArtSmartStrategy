@@ -7,3 +7,5 @@ data/*.sqlite*
 *.pdf
 *.png
 *.log
+*.csv
+NextVersion

@@ -13,7 +13,7 @@ from backend.main import Base  # noqa: E402
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
-config.set_main_option("sqlalchemy.url", os.getenv("DATABASE_URL", "sqlite:///./data/arts_smart.db").replace("%", "%%"))
+config.set_main_option("sqlalchemy.url", os.getenv("DATABASE_URL", "postgresql+psycopg://arts_smart:change-this@localhost:5432/arts_smart").replace("%", "%%"))
 target_metadata = Base.metadata
 
 def run_migrations_offline():
