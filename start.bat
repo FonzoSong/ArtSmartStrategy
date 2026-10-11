@@ -30,18 +30,18 @@ if not exist ".venv\Scripts\python.exe" (
 if not exist ".env" (
   copy ".env.example" ".env" >nul
   echo Created .env from .env.example.
-  echo Edit DATABASE_URL and APP_SECRET before continuing, then run start.bat again.
+  echo Edit DATABASE_URL if needed. APP_SECRET is generated automatically on launch.
   notepad .env
-  goto :finished
 )
 
 call .venv\Scripts\python.exe -m pip install --disable-pip-version-check -r requirements.txt
 if errorlevel 1 goto :failed
 
-call .venv\Scripts\python.exe scripts\ensure_database.py
+call .venv\Scripts\python.exe -c "import backend.settings"
 if errorlevel 1 goto :failed
 
-call .venv\Scripts\python.exe -m alembic upgrade head
+set "SEED_DATA=false"
+call .venv\Scripts\python.exe -m backend.container_entrypoint migrate
 if errorlevel 1 goto :failed
 
 if defined SEED_FLAG if defined FORCE_FLAG (
@@ -54,7 +54,7 @@ if defined SEED_FLAG if not defined FORCE_FLAG (
 )
 
 echo Starting Artsmart at http://127.0.0.1:8000
-call .venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+call .venv\Scripts\python.exe -m backend.container_entrypoint serve
 goto :finished
 
 :failed

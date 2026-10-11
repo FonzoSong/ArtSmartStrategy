@@ -2,29 +2,57 @@ services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: arts_smart
-      POSTGRES_USER: arts_smart
+      POSTGRES_DB: ${POSTGRES_DB:-arts_smart}
+      POSTGRES_USER: ${POSTGRES_USER:-arts_smart}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "arts_smart", "-d", "arts_smart"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h 127.0.0.1 -p 5432 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\"",
+        ]
       interval: 5s
-      timeout: 5s
-      retries: 10
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
+  migrate:
+    build: .
+    command: ["python", "-m", "backend.container_entrypoint", "migrate"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-arts_smart}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-arts_smart}
+      SEED_DATA: ${SEED_DATA:-false}
+      APP_SECRET_FILE: /app/runtime-secret/.env
+    volumes:
+      - ./data:/app/data
+      - app-secret:/app/runtime-secret
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
   artsmart:
     build: .
+    command: ["python", "-m", "backend.container_entrypoint", "serve"]
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+psycopg://arts_smart:${POSTGRES_PASSWORD}@db:5432/arts_smart
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-arts_smart}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-arts_smart}
+      REQUIRE_DATABASE: "true"
       SEED_DATA: ${SEED_DATA:-false}
+      APP_SECRET_FILE: /app/runtime-secret/.env
     volumes:
       - ./data:/app/data
+      - app-secret:/app/runtime-secret
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
+
+volumes:
+  app-secret:

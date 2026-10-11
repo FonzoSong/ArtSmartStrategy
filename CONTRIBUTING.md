@@ -12,7 +12,7 @@ Use Python 3.10 or newer and PostgreSQL 16 or a compatible release. Copy
 python -m venv .venv
 . .venv/bin/activate
 pip install -e ".[dev]"
-alembic upgrade head
+python -m backend.container_entrypoint migrate
 ```
 
 On Windows, use `py -3 -m venv .venv` and activate `.venv\\Scripts\\activate`.

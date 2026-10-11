@@ -82,14 +82,27 @@ def test_empty_history_keeps_reason_explicit_and_empty_drafts_return_empty() -> 
 
 
 def test_duration_constraint_filters_invalid_draft() -> None:
-    """A draft outside its category duration rule receives no suggestion."""
+    """Duration limits are applied in minutes to stored seconds."""
     suggestions = build_schedule_recommendations(
         [],
-        [content(duration=90)],
+        [content(duration=420)],
         load_rule_set(),
         datetime(2026, 10, 12, 10, 0),
     )
     assert suggestions == []
+
+
+def test_duration_rule_accepts_boundary_in_seconds() -> None:
+    """A six-minute educational video meets the configured upper bound."""
+    suggestions = build_schedule_recommendations(
+        [],
+        [content(duration=360)],
+        load_rule_set(),
+        datetime(2026, 10, 12, 10, 0),
+    )
+
+    assert len(suggestions) == 1
+    assert suggestions[0]["target_content_id"] == "draft-1"
 
 
 def test_platform_week_and_daily_limits_are_respected() -> None:

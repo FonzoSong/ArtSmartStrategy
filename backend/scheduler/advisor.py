@@ -65,9 +65,12 @@ def build_schedule_recommendations(
         category_rule = category_rules.get(item.category)
         if category_rule is None:
             continue
+        # Content.duration is stored and entered in seconds; the immutable
+        # ruleset expresses its limits in minutes.
+        duration_minutes = float(getattr(item, "duration", 0) or 0) / 60
         if not (
             category_rule["min_minutes"]
-            <= item.duration
+            <= duration_minutes
             <= category_rule["max_minutes"]
         ):
             continue

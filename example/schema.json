@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["version", "demo_password", "team", "users", "performances", "contents"],
+  "properties": {
+    "version": {"const": 1},
+    "demo_password": {"type": "string", "minLength": 10},
+    "team": {"$ref": "#/$defs/team"},
+    "teams": {"type": "array", "items": {"$ref": "#/$defs/team"}},
+    "users": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["name", "email", "role"], "properties": {"id": {"type": "integer", "minimum": 1}, "team_id": {"type": "integer", "minimum": 1}, "email": {"type": "string", "format": "email"}, "name": {"type": "string"}, "role": {"enum": ["owner", "editor", "viewer"]}}, "additionalProperties": true}},
+    "performances": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "title", "starts_at", "booking_status", "owner_email"], "properties": {"id": {"type": "string", "minLength": 1}, "team_id": {"type": "integer", "minimum": 1}, "title": {"type": "string", "minLength": 1}, "venue": {"type": "string"}, "starts_at": {"type": "string", "format": "date-time"}, "owner_email": {"type": "string", "format": "email"}}, "additionalProperties": true}},
+    "contents": {"type": "array", "minItems": 120, "items": {"type": "object", "required": ["id", "title", "category", "platform", "published_at", "lifecycle", "performance_id", "owner_email", "workflow_state"], "properties": {"id": {"type": "string", "minLength": 1}, "team_id": {"type": "integer", "minimum": 1}, "title": {"type": "string", "minLength": 1}, "category": {"type": "string", "minLength": 1}, "platform": {"type": "string", "minLength": 1}, "published_at": {"type": "string", "format": "date-time"}, "lifecycle": {"enum": ["已发布", "未发布"]}, "workflow_state": {"enum": ["待制作", "已制作", "待排期", "已排期", "已发布", "未发布"]}, "performance_id": {"type": "string"}, "owner_email": {"type": "string", "format": "email"}, "views": {"type": "integer", "minimum": 0}, "likes": {"type": "integer", "minimum": 0}, "comments": {"type": "integer", "minimum": 0}, "saves": {"type": "integer", "minimum": 0}, "shares": {"type": "integer", "minimum": 0}, "completion": {"type": "number", "minimum": 0, "maximum": 100}, "tags": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": true}},
+    "schedules": {"type": "array", "items": {"type": "object", "required": ["content_id", "planned_date", "planned_time", "source", "owner_email"], "properties": {"content_id": {"type": "string"}, "planned_date": {"type": "string", "format": "date"}, "planned_time": {"type": "string"}, "source": {"enum": ["automatic", "manual"]}, "owner_email": {"type": "string", "format": "email"}}, "additionalProperties": true}}
+  },
+  "$defs": {
+    "team": {"type": "object", "required": ["id", "name"], "properties": {"id": {"type": "integer", "minimum": 1}, "name": {"type": "string", "minLength": 1}}, "additionalProperties": true}
+  },
+  "additionalProperties": true
+}

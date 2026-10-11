@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
+import logging
 import os
 import re
 import statistics
 import time
+import uuid
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
@@ -29,9 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from reportlab.pdfbase.ttfonts import TTFError
-from sqlalchemy import (
-    select,
-)
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import (
     Session,
@@ -47,16 +48,33 @@ from backend.analytics import (
     time_label,
 )
 from backend.auth import auth_claims, issue_token, require_editor, role, team_id
-from backend.content import sync_tag_links
-from backend.database import Base, engine, get_db
+from backend.content import normalize_tag_name, sync_tag_links
+from backend.content_rules import (
+    evaluate_rule,
+    rule_conflict,
+    rule_payload,
+    validate_content,
+    validate_rule_definition,
+)
+from backend.database import (
+    DatabaseSchemaError,
+    get_db,
+    runtime_mode,
+    use_database_mode,
+    use_example_mode,
+    verify_database_ready,
+)
 from backend.models import (
     AICallLog,
     AIConfig,
     AuditLog,
     Benchmark,
     Content,
+    ContentRule,
     ContentTag,
+    ContentWorkflowEvent,
     Hypothesis,
+    PerformanceBooking,
     Recommendation,
     RuleExecutionLog,
     Schedule,
@@ -67,6 +85,7 @@ from backend.models import (
 )
 from backend.rules import execute_content_rules
 from backend.scheduler.advisor import build_schedule_recommendations
+from backend.scheduler.ai import apply_ai_schedule, build_schedule_prompt
 from backend.scheduler.rules_loader import load_rule_set_safe
 from backend.schemas import (
     AdoptIn,
@@ -75,6 +94,8 @@ from backend.schemas import (
     BulkContentIn,
     ContentIn,
     LoginIn,
+    ManualScheduleIn,
+    PerformanceIn,
     PublishIn,
     RuleIn,
     SampleSetting,
@@ -83,11 +104,17 @@ from backend.schemas import (
 )
 from backend.security import password_hash, verify_password
 from backend.settings import (
+    AI_BASE_URL,
+    AI_MODEL,
+    DATABASE_CONFIGURED,
+    DATABASE_REQUIRED,
     MIN_SAMPLE_DEFAULT,
     PLATFORMS,
     ROOT,
 )
-from backend.status import normalize_content_status
+from backend.status import WORKFLOW_STATES, normalize_content_status
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def team_or_404(db: Session, tid: int) -> Team:
@@ -104,13 +131,16 @@ def get_config(db: Session, tid: int) -> AIConfig:
         )
     )
     if config:
+        config.base_url = config.base_url or AI_BASE_URL
+        config.api_key = config.api_key or os.getenv("AI_API_KEY", "")
+        config.model = config.model or AI_MODEL
         return config
     config = AIConfig(
         team_id=tid,
         min_sample=MIN_SAMPLE_DEFAULT,
         api_key=os.getenv("AI_API_KEY", ""),
-        base_url=os.getenv("AI_BASE_URL", ""),
-        model=os.getenv("AI_MODEL", ""),
+        base_url=AI_BASE_URL,
+        model=AI_MODEL,
     )
     db.add(config)
     db.flush()
@@ -143,6 +173,7 @@ def serialize_content(
         "source": c.source,
         "lifecycle": normalize_content_status(c.lifecycle),
         "materials": c.materials,
+        "cover_url": c.cover_url,
         "owner": c.owner,
         "notes": c.notes,
         "profile_visits": c.profile_visits,
@@ -152,6 +183,9 @@ def serialize_content(
         "comment_text": c.comment_text,
         "adopted": c.adopted,
         "recommendation_id": c.recommendation_id,
+        "performance_id": c.performance_id,
+        "owner_user_id": c.owner_user_id,
+        "workflow_state": c.workflow_state,
         "score": score_content(c, config) if config else None,
         "created_by": c.created_by,
         "created_at": c.created_at.isoformat(),
@@ -179,6 +213,78 @@ def audit(
     )
 
 
+def validate_schedule_policy(
+    db: Session,
+    team_id: int,
+    planned_date: date,
+    planned_time: str,
+    platform: str,
+    exclude_schedule_id: str | None = None,
+) -> None:
+    """Validate a pending schedule against the read-only project policy.
+
+    Args:
+        db: Active database session.
+        team_id: Team that owns the schedule.
+        planned_date: Selected publication date.
+        planned_time: Selected time window in ``HH:MM`` form.
+        platform: Publication platform.
+        exclude_schedule_id: Existing schedule excluded during an edit.
+
+    Raises:
+        HTTPException: If the ruleset is unavailable or the schedule violates
+            a configured date, time, or frequency constraint.
+    """
+    ruleset = load_rule_set_safe()
+    if ruleset is None:
+        raise HTTPException(503, "内容规则集缺失或无效，无法校验排期")
+    policy = ruleset["schedule_policy"]
+    today = date.today()
+    if planned_date < today:
+        raise HTTPException(422, "排期日期不能早于今天")
+    if planned_date > today + timedelta(
+        days=policy["planning_horizon_days"] - 1
+    ):
+        raise HTTPException(422, "排期日期超出规则集排期周期")
+    weekday_names = {
+        "周一": 0,
+        "周二": 1,
+        "周三": 2,
+        "周四": 3,
+        "周五": 4,
+        "周六": 5,
+        "周日": 6,
+    }
+    if planned_date.weekday() not in {
+        weekday_names[name] for name in policy["weekdays"]
+    }:
+        raise HTTPException(422, "排期日期不符合规则集允许星期")
+    if planned_time not in policy["time_windows"]:
+        raise HTTPException(422, "排期时间不符合规则集允许时间窗")
+    if platform not in policy["platforms"]:
+        raise HTTPException(422, "排期平台不在规则集允许范围内")
+
+    conditions = [
+        Schedule.team_id == team_id,
+        Schedule.status == "待发布",
+    ]
+    if exclude_schedule_id:
+        conditions.append(Schedule.id != exclude_schedule_id)
+    schedules = db.scalars(select(Schedule).where(*conditions)).all()
+    same_day = sum(row.planned_date == planned_date for row in schedules)
+    if same_day >= policy["max_per_day"]:
+        raise HTTPException(422, "该日期已达到规则集每日发布频率上限")
+    iso = planned_date.isocalendar()
+    same_platform_week = sum(
+        row.platform == platform
+        and row.planned_date.isocalendar().year == iso.year
+        and row.planned_date.isocalendar().week == iso.week
+        for row in schedules
+    )
+    if same_platform_week >= policy["max_per_platform_per_week"]:
+        raise HTTPException(422, "该平台本周已达到规则集发布频率上限")
+
+
 def record_from_input(
     data: ContentIn, tid: int, user: str = "团队运营者"
 ) -> Content:
@@ -191,6 +297,35 @@ def record_from_input(
     values["team_id"] = tid
     values["created_by"] = user
     return Content(**values)
+
+
+def validate_owner(db: Session, tid: int, user_id: int | None) -> User | None:
+    """Return a team member selected as owner, rejecting cross-team IDs."""
+    if user_id is None:
+        return None
+    user = db.scalar(
+        select(User).where(User.id == user_id, User.team_id == tid)
+    )
+    if user is None:
+        raise HTTPException(422, "负责人不属于当前团队")
+    return user
+
+
+def validate_performance(
+    db: Session, tid: int, performance_id: str | None
+) -> PerformanceBooking | None:
+    """Return the linked team performance or reject a cross-team reference."""
+    if performance_id is None:
+        return None
+    booking = db.scalar(
+        select(PerformanceBooking).where(
+            PerformanceBooking.id == performance_id,
+            PerformanceBooking.team_id == tid,
+        )
+    )
+    if booking is None:
+        raise HTTPException(422, "关联演出不存在或不属于当前团队")
+    return booking
 
 
 def all_contents(db: Session, tid: int) -> list[Content]:
@@ -489,8 +624,40 @@ def report_pdf(
 
 
 def startup() -> None:
-    """Create database tables without inserting business or demo data."""
-    Base.metadata.create_all(engine)
+    """Verify migrated database readiness or enter example mode if allowed."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    if not DATABASE_CONFIGURED:
+        if DATABASE_REQUIRED:
+            raise RuntimeError("REQUIRE_DATABASE=true，但 DATABASE_URL 未配置")
+        logger.warning("DATABASE_URL is empty; entering example data mode")
+        use_example_mode()
+        return
+    try:
+        verify_database_ready()
+        use_database_mode()
+        logger.info("PostgreSQL is available and its schema is current")
+    except DatabaseSchemaError:
+        logger.exception(
+            "PostgreSQL is reachable but its schema is not ready; "
+            "refusing to start before migrations succeed"
+        )
+        raise
+    except SQLAlchemyError as exc:
+        if DATABASE_REQUIRED:
+            logger.exception(
+                "Required PostgreSQL is unavailable; refusing to start"
+            )
+            raise RuntimeError(
+                "Required PostgreSQL is unavailable during application startup"
+            ) from exc
+        logger.exception("Database startup failed; checking example mode")
+        try:
+            use_example_mode()
+        except RuntimeError as example_error:
+            raise RuntimeError(
+                "PostgreSQL is unavailable and example data could not be loaded"
+            ) from example_error
 
 
 @asynccontextmanager
@@ -522,12 +689,32 @@ def health(db: Session = Depends(get_db), tid: int = Depends(team_id)):
         "database": "connected",
         "team_id": tid,
         "version": app.version,
+        "mode": runtime_mode(),
+    }
+
+
+@app.get("/api/runtime-mode")
+def get_runtime_mode() -> dict[str, str | bool]:
+    """Expose persistence mode so the interface never implies false durability."""
+    is_example = runtime_mode() == "example"
+    return {
+        "mode": runtime_mode(),
+        "persistent": not is_example,
+        "message": (
+            "示例数据模式：修改仅在当前进程内有效，重启后恢复示例文件。"
+            if is_example
+            else "PostgreSQL 数据库模式：修改将持久化保存。"
+        ),
     }
 
 
 @app.get("/api/auth/status")
 def auth_status(db: Session = Depends(get_db)):
-    return {"setup_required": db.scalar(select(User.id).limit(1)) is None}
+    owner_exists = (
+        db.scalar(select(User.id).where(User.role_name == "owner").limit(1))
+        is not None
+    )
+    return {"setup_required": not owner_exists}
 
 
 def auth_result(db: Session, user: User) -> dict[str, Any]:
@@ -551,7 +738,10 @@ def auth_result(db: Session, user: User) -> dict[str, Any]:
 
 @app.post("/api/auth/setup")
 def setup_account(data: AuthSetup, db: Session = Depends(get_db)):
-    if db.scalar(select(User.id).limit(1)) is not None:
+    if (
+        db.scalar(select(User.id).where(User.role_name == "owner").limit(1))
+        is not None
+    ):
         raise HTTPException(409, "管理员账号已经创建，请使用登录")
     team = db.get(Team, 1)
     if not team:
@@ -647,7 +837,7 @@ def logout(
 def list_users(
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
-    _role: str = Depends(require_editor),
+    _role: str = Depends(role),
 ):
     return [
         {
@@ -725,6 +915,94 @@ def create_team(
     return {"id": team.id, "name": team.name}
 
 
+@app.patch("/api/teams/{requested_team_id}")
+def rename_team(
+    requested_team_id: int,
+    data: TeamIn,
+    db: Session = Depends(get_db),
+    tid: int = Depends(team_id),
+    _role: str = Depends(role),
+):
+    """Rename the caller's own team; owner role is required."""
+    if requested_team_id != tid:
+        raise HTTPException(403, "当前账号无权管理该团队")
+    if _role != "owner":
+        raise HTTPException(403, "只有团队负责人可以修改团队信息")
+    team = team_or_404(db, tid)
+    team.name = data.name.strip()
+    db.commit()
+    audit(db, tid, "rename", "team", str(tid), team.name)
+    db.commit()
+    return {"id": team.id, "name": team.name}
+
+
+@app.get("/api/performances")
+def list_performances(
+    db: Session = Depends(get_db), tid: int = Depends(team_id)
+):
+    """List booked performances and their linked promotional assets."""
+    rows = db.scalars(
+        select(PerformanceBooking)
+        .where(PerformanceBooking.team_id == tid)
+        .order_by(PerformanceBooking.starts_at.desc())
+    ).all()
+    owners = {
+        user.id: user.name
+        for user in db.scalars(select(User).where(User.team_id == tid)).all()
+    }
+    return [
+        {
+            "id": row.id,
+            "title": row.title,
+            "venue": row.venue,
+            "starts_at": row.starts_at.isoformat(),
+            "booking_status": row.booking_status,
+            "owner_user_id": row.owner_user_id,
+            "owner": owners.get(row.owner_user_id, ""),
+            "notes": row.notes,
+            "content_count": len(
+                db.scalars(
+                    select(Content.id).where(
+                        Content.team_id == tid,
+                        Content.performance_id == row.id,
+                    )
+                ).all()
+            ),
+        }
+        for row in rows
+    ]
+
+
+@app.post("/api/performances")
+def create_performance(
+    data: PerformanceIn,
+    db: Session = Depends(get_db),
+    tid: int = Depends(team_id),
+    _role: str = Depends(require_editor),
+):
+    """Create a booked performance in the authenticated team."""
+    owner = validate_owner(db, tid, data.owner_user_id)
+    row = PerformanceBooking(
+        id=str(uuid.uuid4()),
+        team_id=tid,
+        title=data.title.strip(),
+        venue=data.venue.strip(),
+        starts_at=data.starts_at,
+        booking_status=data.booking_status,
+        owner_user_id=owner.id if owner else None,
+        notes=data.notes,
+    )
+    db.add(row)
+    db.flush()
+    audit(db, tid, "create", "performance", row.id, row.title)
+    db.commit()
+    return {
+        "id": row.id,
+        "title": row.title,
+        "starts_at": row.starts_at.isoformat(),
+    }
+
+
 @app.get("/api/contents")
 def list_contents(db: Session = Depends(get_db), tid: int = Depends(team_id)):
     team_or_404(db, tid)
@@ -741,11 +1019,14 @@ def create_content(
     data: ContentIn,
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
     team_or_404(db, tid)
     if data.completion > 100:
         raise HTTPException(422, "看完比例不能超过 100%")
+    owner = validate_owner(db, tid, data.owner_user_id)
+    validate_performance(db, tid, data.performance_id)
     near = db.scalars(
         select(Content).where(
             Content.team_id == tid, Content.title == data.title
@@ -755,10 +1036,38 @@ def create_content(
         abs((x.published_at - data.published_at).total_seconds()) < 3 * 86400
         for x in near
     )
-    item = record_from_input(data, tid)
+    item = record_from_input(data, tid, claims["name"])
+    if owner:
+        item.owner = owner.name
+    if item.lifecycle == "已发布":
+        item.workflow_state = "已发布"
+    elif item.workflow_state == "已发布":
+        raise HTTPException(409, "工作流为已发布时，发布状态也必须是已发布")
+    failures = validate_content(
+        db,
+        tid,
+        text=item.title + "\n" + item.notes,
+        tags=data.tags,
+        content_type=item.category,
+        workflow_state=item.workflow_state,
+    )
+    if failures:
+        raise HTTPException(
+            422, {"message": "内容未通过规则校验", "items": failures}
+        )
     db.add(item)
     db.flush()
-    sync_tag_links(db, item, data.tags)
+    sync_tag_links(db, item, data.tags, claims["user_id"])
+    db.add(
+        ContentWorkflowEvent(
+            team_id=tid,
+            content_id=item.id,
+            from_state="",
+            to_state=item.workflow_state,
+            source="manual",
+            actor_user_id=claims["user_id"],
+        )
+    )
     execute_content_rules(db, tid, item, "content.create")
     audit(db, tid, "create", "content", item.id, data.title)
     db.commit()
@@ -788,6 +1097,7 @@ def update_content(
     data: dict[str, Any],
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
     item = db.scalar(
@@ -795,7 +1105,14 @@ def update_content(
     )
     if not item:
         raise HTTPException(404, "内容记录不存在")
+    previous_state = item.workflow_state
     allowed = set(ContentIn.model_fields) - {"tags"}
+    if "owner_user_id" in data:
+        owner = validate_owner(db, tid, data.get("owner_user_id"))
+        item.owner_user_id = owner.id if owner else None
+        item.owner = owner.name if owner else ""
+    if "performance_id" in data:
+        validate_performance(db, tid, data.get("performance_id"))
     for k, v in data.items():
         if k not in allowed and k != "tags":
             continue
@@ -805,15 +1122,52 @@ def update_content(
             )
         if k == "tags":
             item.tags_json = json.dumps(v, ensure_ascii=False)
-            sync_tag_links(db, item, v)
+            try:
+                sync_tag_links(db, item, v, claims["user_id"])
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
         elif k == "lifecycle":
             item.lifecycle = normalize_content_status(v)
+            item.workflow_state = (
+                "已发布" if item.lifecycle == "已发布" else "待排期"
+            )
         else:
             setattr(item, k, v)
+    if "workflow_state" in data:
+        if data["workflow_state"] not in WORKFLOW_STATES:
+            raise HTTPException(422, "内容流程状态无效")
+        if data["workflow_state"] == "已发布" and item.lifecycle != "已发布":
+            raise HTTPException(409, "发布流程状态必须同时具有已发布状态")
+        item.workflow_state = data["workflow_state"]
+    if item.workflow_state == "已发布" and item.lifecycle != "已发布":
+        raise HTTPException(409, "工作流为已发布时，发布状态也必须是已发布")
     item.total_interactions = (
         item.likes + item.comments + item.saves + item.shares
     )
     execute_content_rules(db, tid, item, "content.update")
+    failures = validate_content(
+        db,
+        tid,
+        text=item.title + "\n" + item.notes,
+        tags=json.loads(item.tags_json or "[]"),
+        content_type=item.category,
+        workflow_state=item.workflow_state,
+    )
+    if failures:
+        raise HTTPException(
+            422, {"message": "内容未通过规则校验", "items": failures}
+        )
+    if item.workflow_state != previous_state:
+        db.add(
+            ContentWorkflowEvent(
+                team_id=tid,
+                content_id=item.id,
+                from_state=previous_state,
+                to_state=item.workflow_state,
+                source="manual",
+                actor_user_id=claims["user_id"],
+            )
+        )
     audit(
         db,
         tid,
@@ -821,9 +1175,83 @@ def update_content(
         "content",
         item.id,
         json.dumps(data, ensure_ascii=False),
+        claims["name"],
     )
     db.commit()
     return serialize_content(item, get_config(db, tid))
+
+
+@app.post("/api/contents/{content_id}/advance")
+def advance_content_workflow(
+    content_id: str,
+    db: Session = Depends(get_db),
+    tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
+    _role: str = Depends(require_editor),
+):
+    """Advance a content asset from production pending to produced."""
+    item = db.scalar(
+        select(Content).where(Content.id == content_id, Content.team_id == tid)
+    )
+    if not item:
+        raise HTTPException(404, "内容记录不存在")
+    if item.workflow_state != "待制作":
+        raise HTTPException(409, "仅待制作内容可以推进到已制作")
+    item.workflow_state = "已制作"
+    db.add(
+        ContentWorkflowEvent(
+            team_id=tid,
+            content_id=item.id,
+            from_state="待制作",
+            to_state="已制作",
+            source="manual",
+            actor_user_id=claims["user_id"],
+        )
+    )
+    audit(
+        db,
+        tid,
+        "advance",
+        "content",
+        item.id,
+        "待制作 → 已制作",
+        claims["name"],
+    )
+    db.commit()
+    return {"id": item.id, "workflow_state": item.workflow_state}
+
+
+@app.get("/api/contents/{content_id}/workflow-events")
+def list_content_workflow_events(
+    content_id: str,
+    db: Session = Depends(get_db),
+    tid: int = Depends(team_id),
+    _role: str = Depends(role),
+):
+    """List transitions for a content record in the active team."""
+    if not db.scalar(
+        select(Content.id).where(
+            Content.id == content_id, Content.team_id == tid
+        )
+    ):
+        raise HTTPException(404, "内容记录不存在")
+    return [
+        {
+            "from_state": row.from_state,
+            "to_state": row.to_state,
+            "source": row.source,
+            "actor_user_id": row.actor_user_id,
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in db.scalars(
+            select(ContentWorkflowEvent)
+            .where(
+                ContentWorkflowEvent.content_id == content_id,
+                ContentWorkflowEvent.team_id == tid,
+            )
+            .order_by(ContentWorkflowEvent.created_at.desc())
+        ).all()
+    ]
 
 
 @app.delete("/api/contents/{content_id}")
@@ -838,6 +1266,9 @@ def delete_content(
     )
     if not item:
         raise HTTPException(404, "内容记录不存在")
+    db.query(ContentTag).filter(ContentTag.content_id == item.id).delete(
+        synchronize_session=False
+    )
     audit(db, tid, "delete", "content", item.id, item.title)
     db.delete(item)
     db.commit()
@@ -850,20 +1281,22 @@ def list_rules(
     tid: int = Depends(team_id),
     _role: str = Depends(role),
 ):
-    del db, tid, _role
-    ruleset = load_rule_set_safe()
-    if ruleset is None:
-        return []
-    return [
-        {"id": index, **rule}
-        for index, rule in enumerate(
-            sorted(
-                ruleset["rules"],
-                key=lambda rule: (-rule["priority"], rule["name"]),
-            ),
-            start=1,
+    """List editable, team-scoped content rules in execution order."""
+    result = []
+    for item in db.scalars(
+        select(ContentRule)
+        .where(ContentRule.team_id == tid)
+        .order_by(ContentRule.priority, ContentRule.id)
+    ).all():
+        payload = rule_payload(item)
+        operator = (
+            db.get(User, item.updated_by_user_id)
+            if item.updated_by_user_id
+            else None
         )
-    ]
+        payload["updated_by"] = operator.name if operator else "未记录"
+        result.append(payload)
+    return result
 
 
 @app.post("/api/rules")
@@ -871,10 +1304,96 @@ def create_rule(
     data: RuleIn,
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
-    del data, db, tid
-    raise HTTPException(405, "内容规则集为只读配置，请编辑项目规则 JSON 文件")
+    """Create a rule and reject ambiguous same-priority overlaps."""
+    values = data.model_dump()
+    try:
+        validate_rule_definition(values)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if rule_conflict(
+        db,
+        tid,
+        data.priority,
+        data.rule_type,
+        data.content_type,
+        data.workflow_state,
+    ):
+        raise HTTPException(
+            409, "相同适用范围和优先级已有启用规则，请调整优先级"
+        )
+    row = ContentRule(
+        team_id=tid,
+        name=data.name.strip(),
+        priority=data.priority,
+        enabled=data.enabled,
+        trigger=data.trigger,
+        logic=data.logic,
+        conditions_json=json.dumps(data.conditions, ensure_ascii=False),
+        scope_json=json.dumps(data.scope, ensure_ascii=False),
+        actions_json=json.dumps(data.actions, ensure_ascii=False),
+        rule_type=data.rule_type,
+        rule_content=json.dumps(data.rule_content, ensure_ascii=False),
+        content_type=data.content_type,
+        workflow_state=data.workflow_state,
+        notes=data.notes,
+        created_by_user_id=claims["user_id"],
+        updated_by_user_id=claims["user_id"],
+    )
+    db.add(row)
+    db.flush()
+    audit(
+        db, tid, "create", "content_rule", str(row.id), row.name, claims["name"]
+    )
+    db.commit()
+    return rule_payload(row)
+
+
+@app.post("/api/rules/preview")
+def preview_rule(
+    data: dict[str, Any],
+    db: Session = Depends(get_db),
+    tid: int = Depends(team_id),
+    _role: str = Depends(require_editor),
+):
+    """Try one saved rule against text and return its decision."""
+    rule_id = data.get("rule_id")
+    row = (
+        db.scalar(
+            select(ContentRule).where(
+                ContentRule.id == rule_id, ContentRule.team_id == tid
+            )
+        )
+        if rule_id
+        else None
+    )
+    if row is None:
+        definition = data.get("rule") or data
+        try:
+            validate_rule_definition(definition)
+            row = ContentRule(
+                team_id=tid,
+                name=str(definition.get("name", "试运行规则")),
+                rule_type=definition["rule_type"],
+                rule_content=json.dumps(
+                    definition.get("rule_content", {}), ensure_ascii=False
+                ),
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+    try:
+        message = evaluate_rule(
+            row, str(data.get("text", "")), list(data.get("tags", []))
+        )
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, f"规则无法运行：{exc}") from exc
+    return {
+        "matched": message is not None,
+        "result": message or "通过",
+        "rule_name": row.name,
+    }
 
 
 @app.patch("/api/rules/{rule_id}")
@@ -883,10 +1402,58 @@ def update_rule(
     data: dict[str, Any],
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
-    del rule_id, data, db, tid
-    raise HTTPException(405, "内容规则集为只读配置，请编辑项目规则 JSON 文件")
+    """Update a rule without crossing team boundaries."""
+    row = db.scalar(
+        select(ContentRule).where(
+            ContentRule.id == rule_id, ContentRule.team_id == tid
+        )
+    )
+    if not row:
+        raise HTTPException(404, "规则不存在")
+    current = rule_payload(row)
+    current.update(data)
+    try:
+        validate_rule_definition(current)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    enabled = bool(current.get("enabled", row.enabled))
+    if enabled and rule_conflict(
+        db,
+        tid,
+        int(current.get("priority", row.priority)),
+        str(current.get("rule_type", row.rule_type)),
+        str(current.get("content_type", row.content_type)),
+        str(current.get("workflow_state", row.workflow_state)),
+        rule_id,
+    ):
+        raise HTTPException(
+            409, "相同适用范围和优先级已有启用规则，请调整优先级"
+        )
+    for key in (
+        "name",
+        "priority",
+        "enabled",
+        "content_type",
+        "workflow_state",
+        "notes",
+    ):
+        if key in data:
+            setattr(row, key, data[key])
+    if "rule_type" in current:
+        row.rule_type = current["rule_type"]
+    if "rule_content" in current:
+        row.rule_content = json.dumps(
+            current["rule_content"], ensure_ascii=False
+        )
+    row.updated_by_user_id = claims["user_id"]
+    audit(
+        db, tid, "update", "content_rule", str(row.id), row.name, claims["name"]
+    )
+    db.commit()
+    return rule_payload(row)
 
 
 @app.delete("/api/rules/{rule_id}")
@@ -894,10 +1461,23 @@ def delete_rule(
     rule_id: int,
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
-    del rule_id, db, tid
-    raise HTTPException(405, "内容规则集为只读配置，不能从应用内删除")
+    """Delete one managed rule in the authenticated team."""
+    row = db.scalar(
+        select(ContentRule).where(
+            ContentRule.id == rule_id, ContentRule.team_id == tid
+        )
+    )
+    if not row:
+        raise HTTPException(404, "规则不存在")
+    audit(
+        db, tid, "delete", "content_rule", str(row.id), row.name, claims["name"]
+    )
+    db.delete(row)
+    db.commit()
+    return {"deleted": True}
 
 
 @app.get("/api/rules/logs")
@@ -959,6 +1539,7 @@ def bulk_contents(
     data: BulkContentIn,
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
     ids = list(dict.fromkeys(data.ids))
@@ -969,6 +1550,9 @@ def bulk_contents(
         raise HTTPException(404, "部分内容记录不存在或不属于当前团队")
     if data.action == "delete":
         for item in items:
+            db.query(ContentTag).filter(
+                ContentTag.content_id == item.id
+            ).delete(synchronize_session=False)
             audit(
                 db, tid, "delete", "content", item.id, f"批量删除：{item.title}"
             )
@@ -978,7 +1562,22 @@ def bulk_contents(
             raise HTTPException(422, "状态只能是已发布或未发布")
         for item in items:
             previous = item.lifecycle
+            previous_workflow = item.workflow_state
             item.lifecycle = data.status
+            item.workflow_state = (
+                "已发布" if data.status == "已发布" else "未发布"
+            )
+            if previous_workflow != item.workflow_state:
+                db.add(
+                    ContentWorkflowEvent(
+                        team_id=tid,
+                        content_id=item.id,
+                        from_state=previous_workflow,
+                        to_state=item.workflow_state,
+                        source="manual",
+                        actor_user_id=claims["user_id"],
+                    )
+                )
             execute_content_rules(db, tid, item, "content.update")
             audit(
                 db,
@@ -999,6 +1598,7 @@ async def import_csv(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
     raw = await file.read()
@@ -1025,6 +1625,11 @@ async def import_csv(
         "完播率": "completion",
         "状态标签": "lifecycle",
         "状态": "lifecycle",
+        "封面": "cover_url",
+        "封面地址": "cover_url",
+        "关联演出": "performance_title",
+        "关联演出ID": "performance_id",
+        "工作流状态": "workflow_state",
         "标签": "tags",
         "素材说明": "materials",
         "责任人": "owner",
@@ -1095,6 +1700,40 @@ async def import_csv(
                 )
                 continue
             status = normalize_content_status(r.get("lifecycle") or "已发布")
+            owner_name = str(r.get("owner") or "").strip()
+            owner_user = (
+                db.scalar(
+                    select(User)
+                    .where(
+                        User.team_id == tid,
+                        (User.name == owner_name)
+                        | (User.email == owner_name.lower()),
+                    )
+                    .limit(1)
+                )
+                if owner_name
+                else None
+            )
+            performance_id = r.get("performance_id") or None
+            if r.get("performance_title"):
+                booking = db.scalar(
+                    select(PerformanceBooking).where(
+                        PerformanceBooking.team_id == tid,
+                        PerformanceBooking.title
+                        == str(r["performance_title"]).strip(),
+                    )
+                )
+                if booking is None:
+                    raise ValueError("关联演出不存在或不属于当前团队")
+                performance_id = booking.id
+            workflow_state = r.get("workflow_state") or (
+                "已发布" if status == "已发布" else "待排期"
+            )
+            if workflow_state not in WORKFLOW_STATES:
+                raise ValueError("工作流状态无效")
+            if workflow_state == "已发布" and status != "已发布":
+                raise ValueError("工作流为已发布时，状态标签也必须是已发布")
+            validate_performance(db, tid, performance_id)
             item = Content(
                 team_id=tid,
                 title=title,
@@ -1121,7 +1760,11 @@ async def import_csv(
                 source="csv",
                 lifecycle=status,
                 materials=str(r.get("materials") or ""),
-                owner=str(r.get("owner") or ""),
+                cover_url=str(r.get("cover_url") or ""),
+                owner=owner_name,
+                owner_user_id=owner_user.id if owner_user else None,
+                performance_id=performance_id,
+                workflow_state=workflow_state,
                 notes=str(r.get("notes") or ""),
                 profile_visits=num("profile_visits"),
                 follows=num("follows"),
@@ -1129,9 +1772,34 @@ async def import_csv(
                 tickets=num("tickets"),
                 comment_text=str(r.get("comment_text") or ""),
             )
+            failures = validate_content(
+                db,
+                tid,
+                text=item.title + "\n" + item.notes,
+                tags=json.loads(item.tags_json or "[]"),
+                content_type=item.category,
+                workflow_state=item.workflow_state,
+            )
+            if failures:
+                raise ValueError(
+                    "内容未通过规则校验："
+                    + "；".join(x["message"] for x in failures)
+                )
             db.add(item)
             db.flush()
-            sync_tag_links(db, item, json.loads(item.tags_json))
+            sync_tag_links(
+                db, item, json.loads(item.tags_json), claims["user_id"]
+            )
+            db.add(
+                ContentWorkflowEvent(
+                    team_id=tid,
+                    content_id=item.id,
+                    from_state="",
+                    to_state=item.workflow_state,
+                    source="manual",
+                    actor_user_id=claims["user_id"],
+                )
+            )
             execute_content_rules(db, tid, item, "content.import")
             added.append(item)
         except (
@@ -1162,20 +1830,40 @@ def classify(title: str) -> str:
     return "演出宣传"
 
 
+def _user_name_or_default(
+    db: Session, user_id: int | None, default: str
+) -> str:
+    """Return a user's display name, or a supplied fallback label."""
+    user = db.get(User, user_id) if user_id is not None else None
+    return user.name if user else default
+
+
 @app.get("/api/tags")
-def list_tags(db: Session = Depends(get_db), tid: int = Depends(team_id)):
+def list_tags(
+    db: Session = Depends(get_db),
+    tid: int = Depends(team_id),
+    _role: str = Depends(role),
+):
+    """List team tags with usage counts and creator metadata."""
+    rows = db.scalars(
+        select(Tag).where(Tag.team_id == tid).order_by(Tag.name)
+    ).all()
     return [
         {
-            "id": t.id,
-            "name": t.name,
-            "color": t.color,
+            "id": item.id,
+            "name": item.name,
+            "color": item.color,
+            "active": item.is_active,
             "count": db.query(ContentTag)
-            .filter(ContentTag.tag_id == t.id)
+            .filter(ContentTag.tag_id == item.id)
             .count(),
+            "created_at": item.created_at.isoformat(),
+            "created_by_user_id": item.created_by_user_id,
+            "created_by": _user_name_or_default(
+                db, item.created_by_user_id, "未记录"
+            ),
         }
-        for t in db.scalars(
-            select(Tag).where(Tag.team_id == tid).order_by(Tag.name)
-        ).all()
+        for item in rows
     ]
 
 
@@ -1184,26 +1872,139 @@ def create_tag(
     data: dict[str, str],
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
-    name = data.get("name", "").strip()
-    if not name:
-        raise HTTPException(422, "标签名称不能为空")
+    """Create a normalized, team-local tag or return the existing one."""
+    try:
+        name, key = normalize_tag_name(data.get("name", ""))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     existing = db.scalar(
-        select(Tag).where(Tag.team_id == tid, Tag.name == name)
+        select(Tag).where(Tag.team_id == tid, Tag.normalized_name == key)
     )
     if existing:
+        if not existing.is_active:
+            raise HTTPException(409, "该 Tag 已停用，请先启用后再使用")
         return {
             "id": existing.id,
             "name": existing.name,
             "color": existing.color,
         }
-    t = Tag(team_id=tid, name=name, color=data.get("color", "#647383"))
-    db.add(t)
+    item = Tag(
+        team_id=tid,
+        name=name,
+        normalized_name=key,
+        color=data.get("color", "#647383"),
+        created_by_user_id=claims["user_id"],
+    )
+    db.add(item)
     db.flush()
-    audit(db, tid, "create", "tag", str(t.id), name)
+    audit(db, tid, "create", "tag", str(item.id), name, claims["name"])
     db.commit()
-    return {"id": t.id, "name": t.name, "color": t.color}
+    return {"id": item.id, "name": item.name, "color": item.color}
+
+
+@app.patch("/api/tags/{tag_id}")
+def update_tag(
+    tag_id: int,
+    data: dict[str, Any],
+    db: Session = Depends(get_db),
+    tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
+    _role: str = Depends(require_editor),
+):
+    """Rename, recolor, or activate/deactivate a team tag."""
+    item = db.scalar(select(Tag).where(Tag.id == tag_id, Tag.team_id == tid))
+    if not item:
+        raise HTTPException(404, "Tag 不存在")
+    if "name" in data:
+        try:
+            name, key = normalize_tag_name(str(data["name"]))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        conflict = db.scalar(
+            select(Tag.id).where(
+                Tag.team_id == tid, Tag.normalized_name == key, Tag.id != tag_id
+            )
+        )
+        if conflict:
+            raise HTTPException(409, "名称等价的 Tag 已存在，可使用合并功能")
+        old_name = item.name
+        linked_contents = db.scalars(
+            select(Content)
+            .join(ContentTag, ContentTag.content_id == Content.id)
+            .where(ContentTag.tag_id == item.id, Content.team_id == tid)
+        ).all()
+        for content in linked_contents:
+            current_tags = json.loads(content.tags_json or "[]")
+            content.tags_json = json.dumps(
+                [
+                    name if value == old_name else value
+                    for value in current_tags
+                ],
+                ensure_ascii=False,
+            )
+        item.name, item.normalized_name = name, key
+    if "color" in data:
+        item.color = str(data["color"])
+    if "active" in data:
+        item.is_active = bool(data["active"])
+    audit(db, tid, "update", "tag", str(item.id), item.name, claims["name"])
+    db.commit()
+    return {"id": item.id, "name": item.name, "active": item.is_active}
+
+
+@app.post("/api/tags/{tag_id}/merge")
+def merge_tag(
+    tag_id: int,
+    data: dict[str, int],
+    db: Session = Depends(get_db),
+    tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
+    _role: str = Depends(require_editor),
+):
+    """Move historical associations to a target tag and deactivate source."""
+    source_id, target_id = tag_id, data.get("target_id")
+    source = db.scalar(
+        select(Tag).where(Tag.id == source_id, Tag.team_id == tid)
+    )
+    target = db.scalar(
+        select(Tag).where(Tag.id == target_id, Tag.team_id == tid)
+    )
+    if not source or not target or source.id == target.id:
+        raise HTTPException(422, "请选择同一团队中两个不同的 Tag")
+    links = db.scalars(
+        select(ContentTag).where(ContentTag.tag_id == source.id)
+    ).all()
+    for link in links:
+        content = db.get(Content, link.content_id)
+        if content:
+            current_tags = json.loads(content.tags_json or "[]")
+            content.tags_json = json.dumps(
+                [
+                    target.name if value == source.name else value
+                    for value in current_tags
+                ],
+                ensure_ascii=False,
+            )
+        duplicate = db.get(ContentTag, (link.content_id, target.id))
+        if duplicate:
+            db.delete(link)
+        else:
+            link.tag_id = target.id
+    source.is_active = False
+    audit(
+        db,
+        tid,
+        "merge",
+        "tag",
+        str(source.id),
+        f"合并到 {target.name}",
+        claims["name"],
+    )
+    db.commit()
+    return {"merged": True, "target_id": target.id}
 
 
 @app.delete("/api/tags/{tag_id}")
@@ -1211,14 +2012,17 @@ def delete_tag(
     tag_id: int,
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
-    t = db.scalar(select(Tag).where(Tag.id == tag_id, Tag.team_id == tid))
-    if not t:
-        raise HTTPException(404, "标签不存在")
-    db.delete(t)
+    """Deactivate a tag while retaining historical content links."""
+    item = db.scalar(select(Tag).where(Tag.id == tag_id, Tag.team_id == tid))
+    if not item:
+        raise HTTPException(404, "Tag 不存在")
+    item.is_active = False
+    audit(db, tid, "deactivate", "tag", str(item.id), item.name, claims["name"])
     db.commit()
-    return {"deleted": True}
+    return {"deleted": True, "historical_links_retained": True}
 
 
 def overview_data(db: Session, tid: int) -> dict[str, Any]:
@@ -1790,33 +2594,130 @@ async def ai_test(db: Session = Depends(get_db), tid: int = Depends(team_id)):
 async def ai_recommend(
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    _role: str = Depends(require_editor),
     force_rule: bool = Query(default=False),
 ):
-    del force_rule
+    del _role
     records = published_contents(db, tid)
     drafts = unpublished_contents(db, tid)
     config = get_config(db, tid)
-    summary = dataset_summary(records, config)
     start = time.time()
     ruleset = load_rule_set_safe()
     if ruleset is None:
         raise HTTPException(503, "内容规则集缺失或无效，暂时无法生成排期建议")
+    existing_schedules = db.scalars(
+        select(Schedule).where(
+            Schedule.team_id == tid,
+            Schedule.status == "待发布",
+        )
+    ).all()
     recs = build_schedule_recommendations(
         records,
         drafts,
         ruleset,
         datetime.now(),
         config.min_sample,
-        db.scalars(
-            select(Schedule).where(
-                Schedule.team_id == tid,
-                Schedule.status == "待发布",
-            )
-        ).all(),
+        existing_schedules,
     )
-    source = "ruleset-v0.4"
-    source_label = "项目只读内容规则集"
-    error = None
+    source = "rules-engine"
+    source_label = "本地规则引擎"
+    error = "已请求使用规则引擎。" if force_rule else None
+    analysis_status = "rules_only"
+    matching_candidates: list[dict[str, Any]] = []
+    if (
+        recs
+        and not force_rule
+        and config.enabled
+        and config.base_url
+        and config.api_key
+        and config.model
+    ):
+        unpublished_by_id = {item.id: item for item in drafts}
+        for suggestion in recs:
+            target = unpublished_by_id[suggestion["target_content_id"]]
+            samples = [
+                item
+                for item in records
+                if item.category == target.category
+                and item.platform == target.platform
+            ]
+            matching_candidates.append(
+                {
+                    "draft_id": target.id,
+                    "category": target.category,
+                    "platform": target.platform,
+                    "duration_seconds": target.duration,
+                    "rule_suggestion": {
+                        "planned_date": suggestion["planned_date"],
+                        "time_slot": suggestion["time_slot"],
+                    },
+                    "published_sample_count": len(samples),
+                    "published_samples": [
+                        {
+                            "published_at": item.published_at.isoformat(),
+                            "views": item.views,
+                            "likes": item.likes,
+                            "comments": item.comments,
+                            "saves": item.saves,
+                            "shares": item.shares,
+                            "completion": item.completion,
+                        }
+                        for item in samples[-30:]
+                    ],
+                }
+            )
+        try:
+            prompt = build_schedule_prompt(matching_candidates, ruleset)
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await asyncio.wait_for(
+                    client.post(
+                        model_endpoint(config),
+                        headers=model_headers(config),
+                        json={
+                            "model": config.model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": config.temperature,
+                            "response_format": {"type": "json_object"},
+                        },
+                    ),
+                    timeout=60.0,
+                )
+            response.raise_for_status()
+            body = response.json()
+            model_text = body["choices"][0]["message"]["content"]
+            recs = apply_ai_schedule(
+                model_text, recs, ruleset, date.today(), existing_schedules
+            )
+            source = "AI"
+            source_label = f"AI 排期分析 · {config.model}"
+            analysis_status = "completed"
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            error = "AI 单次分析超过 60 秒，已停止等待并切换到本地规则引擎。"
+            analysis_status = "fallback_timeout"
+        except (
+            httpx.HTTPError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            error = (
+                f"AI 分析失败或响应无效，已切换到本地规则引擎：{str(exc)[:240]}"
+            )
+            analysis_status = "fallback_error"
+    elif recs and not force_rule:
+        error = "模型未完整配置，已使用本地规则引擎。"
+        analysis_status = "fallback_unconfigured"
+    for item in recs:
+        item.setdefault("suggestion_source", "规则引擎")
+        item.setdefault("analysis_status", analysis_status)
+        item.setdefault(
+            "limitations",
+            "样本仅限当前团队同类型、同平台已发布内容；样本不足时不推断效果。",
+        )
+    if not recs:
+        analysis_status = "no_candidates"
+        error = error or "当前没有符合规则的未发布内容可排期。"
     recommendation = Recommendation(
         team_id=tid,
         payload_json=json.dumps(recs, ensure_ascii=False),
@@ -1827,16 +2728,22 @@ async def ai_recommend(
             key=lambda x: {"low": 0, "medium": 1, "high": 2}[x],
             default="low",
         ),
-        reference_count=len(records),
+        reference_count=max(
+            (x["reference_sample_count"] for x in recs), default=0
+        ),
+        analysis_status=analysis_status,
+        fallback_reason=error or "",
     )
     db.add(recommendation)
     db.add(
         AICallLog(
             team_id=tid,
-            input_summary=json.dumps(summary, ensure_ascii=False)[:4000],
+            input_summary=json.dumps(matching_candidates, ensure_ascii=False)[
+                :4000
+            ],
             output_summary=json.dumps(recs, ensure_ascii=False)[:4000],
             elapsed_ms=int((time.time() - start) * 1000),
-            status="ok",
+            status="ok" if source == "AI" else analysis_status,
         )
     )
     audit(
@@ -1849,11 +2756,17 @@ async def ai_recommend(
         "recommendations": recs,
         "source": source,
         "source_label": source_label,
-        "reference_count": len(records),
+        "reference_count": recommendation.reference_count,
         "confidence": recommendation.confidence,
-        "confidence_note": sample_notice(len(records), config.min_sample),
+        "confidence_note": sample_notice(
+            recommendation.reference_count, config.min_sample
+        ),
         "fallback_reason": error,
-        "data_summary": summary,
+        "analysis_status": analysis_status,
+        "data_summary": {
+            "published_sample_count": len(records),
+            "unpublished_target_count": len(drafts),
+        },
     }
 
 
@@ -1929,10 +2842,57 @@ def list_recommendations(
             "source_label": x.source_label,
             "reference_count": x.reference_count,
             "confidence": x.confidence,
+            "analysis_status": x.analysis_status,
+            "fallback_reason": x.fallback_reason,
             "adopted": x.adopted,
         }
         for x in rows
     ]
+
+
+@app.patch("/api/recommendations/{recommendation_id}")
+def update_recommendation(
+    recommendation_id: str,
+    data: dict[str, Any],
+    db: Session = Depends(get_db),
+    tid: int = Depends(team_id),
+    _role: str = Depends(require_editor),
+):
+    """Edit or cancel candidates without allowing new target creation."""
+    row = db.scalar(
+        select(Recommendation).where(
+            Recommendation.id == recommendation_id,
+            Recommendation.team_id == tid,
+        )
+    )
+    if row is None:
+        raise HTTPException(404, "建议记录不存在")
+    recommendations = data.get("recommendations")
+    original = json.loads(row.payload_json)
+    if not isinstance(recommendations, list):
+        raise HTTPException(422, "recommendations 必须是列表")
+    allowed_ids = {str(item.get("target_content_id")) for item in original}
+    requested_ids = [
+        str(item.get("target_content_id")) for item in recommendations
+    ]
+    if (
+        len(requested_ids) != len(set(requested_ids))
+        or not set(requested_ids) <= allowed_ids
+    ):
+        raise HTTPException(422, "只能编辑或取消此建议原有的未发布内容")
+    targets = db.scalars(
+        select(Content).where(
+            Content.team_id == tid,
+            Content.id.in_(requested_ids or ["__none__"]),
+        )
+    ).all()
+    if len(targets) != len(requested_ids) or any(
+        item.lifecycle != "未发布" for item in targets
+    ):
+        raise HTTPException(409, "建议目标已发布或已移出当前团队")
+    row.payload_json = json.dumps(recommendations, ensure_ascii=False)
+    db.commit()
+    return {"id": row.id, "recommendations": recommendations}
 
 
 @app.get("/api/schedule")
@@ -1963,6 +2923,14 @@ def get_schedule(
             "owner": x.owner,
             "reason": x.reason,
             "status": x.status,
+            "source": x.source,
+            "source_label": "系统自动"
+            if x.source == "automatic"
+            else "用户手动",
+            "operator_id": x.created_by_user_id,
+            "operator": _user_name_or_default(
+                db, x.created_by_user_id, "未知操作人"
+            ),
             "prediction_views_low": x.prediction_views_low,
             "prediction_views_high": x.prediction_views_high,
             "actual_completion": x.actual_completion,
@@ -2014,11 +2982,108 @@ def export_schedule(db: Session = Depends(get_db), tid: int = Depends(team_id)):
     )
 
 
+@app.post("/api/schedule/manual")
+def create_manual_schedule(
+    data: ManualScheduleIn,
+    db: Session = Depends(get_db),
+    tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
+    _role: str = Depends(require_editor),
+):
+    """Persist a manually selected schedule for an unpublished asset."""
+    content = db.scalar(
+        select(Content).where(
+            Content.id == data.content_id, Content.team_id == tid
+        )
+    )
+    if not content:
+        raise HTTPException(404, "排期目标内容不存在")
+    if normalize_content_status(content.lifecycle) != "未发布":
+        raise HTTPException(409, "已发布内容不能再次排期")
+    existing = db.scalar(
+        select(Schedule).where(
+            Schedule.team_id == tid,
+            Schedule.content_id == content.id,
+            Schedule.status == "待发布",
+        )
+    )
+    if existing:
+        raise HTTPException(
+            409,
+            {
+                "message": "该内容已有排期，请调整现有排期",
+                "schedule_id": existing.id,
+            },
+        )
+    planned_date = data.planned_date.date()
+    validate_schedule_policy(
+        db,
+        tid,
+        planned_date,
+        data.planned_time,
+        content.platform,
+    )
+    row = Schedule(
+        team_id=tid,
+        content_id=content.id,
+        planned_date=planned_date,
+        planned_time=data.planned_time,
+        title=content.title,
+        category=content.category,
+        platform=content.platform,
+        owner=content.owner,
+        reason="负责人手动选择发布时间",
+        source="manual",
+        created_by_user_id=claims["user_id"],
+    )
+    previous_state = content.workflow_state
+    content.workflow_state = "已排期"
+    content.published_at = datetime.combine(planned_date, datetime.min.time())
+    db.add(row)
+    db.add(
+        ContentWorkflowEvent(
+            team_id=tid,
+            content_id=content.id,
+            from_state=previous_state,
+            to_state=content.workflow_state,
+            source="manual",
+            actor_user_id=claims["user_id"],
+        )
+    )
+    audit(
+        db,
+        tid,
+        "manual_schedule",
+        "content",
+        content.id,
+        data.planned_date.isoformat(),
+        claims["name"],
+    )
+    db.commit()
+    return {
+        "id": row.id,
+        "content_id": content.id,
+        "source": row.source,
+        "planned_date": planned_date.isoformat(),
+        "planned_time": data.planned_time,
+    }
+
+
+@app.get("/api/schedule/policy")
+def get_schedule_policy():
+    """Expose allowed manual scheduling windows from the project ruleset."""
+    ruleset = load_rule_set_safe()
+    if ruleset is None:
+        raise HTTPException(503, "内容规则集缺失或无效，无法读取排期规则")
+    return ruleset["schedule_policy"]
+
+
 @app.post("/api/schedule/adopt")
 def adopt(
     data: AdoptIn,
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
     rec = db.scalar(
@@ -2029,7 +3094,9 @@ def adopt(
     )
     if not rec:
         raise HTTPException(404, "建议记录不存在")
-    items = data.items or json.loads(rec.payload_json)
+    items = data.items
+    if not items:
+        raise HTTPException(422, "至少保留一条建议后再采纳")
     created = []
     today = date.today()
     weekday_names = {
@@ -2042,6 +3109,24 @@ def adopt(
         "周日": 6,
     }
     next_monday = today + timedelta(days=(7 - today.weekday()) % 7 or 7)
+    ruleset = load_rule_set_safe()
+    if ruleset is None:
+        raise HTTPException(503, "内容规则集缺失或无效，无法采纳排期")
+    policy = ruleset["schedule_policy"]
+    schedule_rows = db.scalars(
+        select(Schedule).where(
+            Schedule.team_id == tid, Schedule.status == "待发布"
+        )
+    ).all()
+    daily_counts: dict[date, int] = {}
+    weekly_counts: dict[tuple[str, int, int], int] = {}
+    for scheduled in schedule_rows:
+        daily_counts[scheduled.planned_date] = (
+            daily_counts.get(scheduled.planned_date, 0) + 1
+        )
+        iso = scheduled.planned_date.isocalendar()
+        key = (scheduled.platform, iso.year, iso.week)
+        weekly_counts[key] = weekly_counts.get(key, 0) + 1
     for i, item in enumerate(items):
         day = item.get("day_of_week", "周三")
         delta = (weekday_names.get(day, 2) - next_monday.weekday()) % 7
@@ -2054,14 +3139,32 @@ def adopt(
             )
         except (TypeError, ValueError) as exc:
             raise HTTPException(422, "建议计划日期格式无效") from exc
-        if planned.weekday() != weekday_names.get(day, planned.weekday()):
-            planned = next_monday + timedelta(days=delta + 7 * ((i + 1) // 3))
+        if planned < today or planned > today + timedelta(
+            days=policy["planning_horizon_days"] - 1
+        ):
+            raise HTTPException(422, "计划日期超出规则集排期周期")
+        if planned.weekday() not in {
+            weekday_names[name] for name in policy["weekdays"]
+        }:
+            raise HTTPException(422, "计划日期不符合规则集允许星期")
         time_text = item.get("time_slot", "19:30")
         try:
             datetime.strptime(time_text[:5], "%H:%M")
         except (TypeError, ValueError) as exc:
             raise HTTPException(422, "建议计划时间格式无效") from exc
+        if time_text[:5] not in policy["time_windows"]:
+            raise HTTPException(422, "计划时间不符合规则集允许时间窗")
+        platform = item.get("platform", PLATFORMS[0])
+        daily_counts[planned] = daily_counts.get(planned, 0) + 1
+        iso = planned.isocalendar()
+        weekly_key = (platform, iso.year, iso.week)
+        weekly_counts[weekly_key] = weekly_counts.get(weekly_key, 0) + 1
+        if daily_counts[planned] > policy["max_per_day"]:
+            raise HTTPException(422, "计划日期超过规则集每日发布频率")
+        if weekly_counts[weekly_key] > policy["max_per_platform_per_week"]:
+            raise HTTPException(422, "计划日期超过该平台每周发布频率")
         target_content_id = item.get("target_content_id")
+        target_content: Content | None = None
         if target_content_id:
             target_content = db.scalar(
                 select(Content).where(
@@ -2081,7 +3184,9 @@ def adopt(
                 )
             )
             if existing_schedule:
-                raise HTTPException(409, "该内容已存在待发布排期")
+                raise HTTPException(
+                    409, "该内容已有排期；请在日历调整现有排期后再采纳"
+                )
         schedule = Schedule(
             team_id=tid,
             recommendation_id=rec.id,
@@ -2090,16 +3195,37 @@ def adopt(
             planned_time=time_text[:5],
             title=item.get("title", item.get("content_type", "内容建议")),
             category=item.get("content_type", "艺术科普"),
-            platform=item.get("platform", PLATFORMS[0]),
+            platform=platform,
             owner=item.get("owner", ""),
             reason=item.get("reason", ""),
+            source="automatic",
+            created_by_user_id=claims["user_id"],
             prediction_views_low=item.get("prediction_views_low"),
             prediction_views_high=item.get("prediction_views_high"),
         )
         db.add(schedule)
+        if target_content is not None:
+            previous_state = target_content.workflow_state
+            target_content.workflow_state = "已排期"
+            db.add(
+                ContentWorkflowEvent(
+                    team_id=tid,
+                    content_id=target_content.id,
+                    from_state=previous_state,
+                    to_state=target_content.workflow_state,
+                    source="system",
+                    actor_user_id=claims["user_id"],
+                )
+            )
+            target_content.adopted = True
+            target_content.recommendation_id = rec.id
+            target_content.published_at = datetime.combine(
+                planned, datetime.min.time()
+            )
         db.flush()
         created.append(schedule)
     rec.adopted = True
+    rec.payload_json = json.dumps(items, ensure_ascii=False)
     audit(
         db,
         tid,
@@ -2132,6 +3258,7 @@ def update_schedule(
     data: dict[str, Any],
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
     item = db.scalar(
@@ -2152,13 +3279,51 @@ def update_schedule(
     }
     for k, v in data.items():
         if k in allowed:
-            setattr(
-                item,
-                k,
-                date.fromisoformat(v)
-                if k == "planned_date" and isinstance(v, str)
-                else v,
+            try:
+                value = (
+                    date.fromisoformat(v)
+                    if k == "planned_date" and isinstance(v, str)
+                    else v
+                )
+            except ValueError as exc:
+                raise HTTPException(422, "排期日期格式无效") from exc
+            setattr(item, k, value)
+    if item.status == "待发布":
+        validate_schedule_policy(
+            db,
+            tid,
+            item.planned_date,
+            item.planned_time,
+            item.platform,
+            exclude_schedule_id=item.id,
+        )
+    item.source = "manual"
+    item.created_by_user_id = claims["user_id"]
+    if item.content_id:
+        target = db.scalar(
+            select(Content).where(
+                Content.id == item.content_id, Content.team_id == tid
             )
+        )
+        if target and target.lifecycle == "未发布":
+            previous_state = target.workflow_state
+            target.published_at = datetime.combine(
+                item.planned_date, datetime.min.time()
+            )
+            target.workflow_state = (
+                "已排期" if item.status == "待发布" else "待排期"
+            )
+            if previous_state != target.workflow_state:
+                db.add(
+                    ContentWorkflowEvent(
+                        team_id=tid,
+                        content_id=target.id,
+                        from_state=previous_state,
+                        to_state=target.workflow_state,
+                        source="manual",
+                        actor_user_id=claims["user_id"],
+                    )
+                )
     audit(
         db,
         tid,
@@ -2174,6 +3339,8 @@ def update_schedule(
         "planned_time": item.planned_time,
         "title": item.title,
         "status": item.status,
+        "source": item.source,
+        "operator_id": item.created_by_user_id,
     }
 
 
@@ -2183,6 +3350,7 @@ def publish_schedule(
     data: PublishIn,
     db: Session = Depends(get_db),
     tid: int = Depends(team_id),
+    claims: dict[str, Any] = Depends(auth_claims),
     _role: str = Depends(require_editor),
 ):
     schedule = db.scalar(
@@ -2215,6 +3383,7 @@ def publish_schedule(
             data.likes + data.comments + data.saves + data.shares
         ),
         "lifecycle": "已发布",
+        "workflow_state": "已发布",
         "profile_visits": data.profile_visits,
         "follows": data.follows,
         "attendance": data.attendance,
@@ -2223,13 +3392,26 @@ def publish_schedule(
         "adopted": bool(schedule.recommendation_id),
         "recommendation_id": schedule.recommendation_id,
     }
+    previous_workflow = item.workflow_state if item is not None else ""
     if item is None:
         item = Content(team_id=tid, duration=0, source="feedback", **values)
         db.add(item)
     else:
         for field, value in values.items():
             setattr(item, field, value)
+    if schedule.owner and not item.owner:
+        item.owner = schedule.owner
     db.flush()
+    db.add(
+        ContentWorkflowEvent(
+            team_id=tid,
+            content_id=item.id,
+            from_state=previous_workflow,
+            to_state="已发布",
+            source="manual",
+            actor_user_id=claims["user_id"],
+        )
+    )
     execute_content_rules(db, tid, item, "content.update")
     schedule.content_id = item.id
     schedule.status = "已复盘"
@@ -2356,6 +3538,12 @@ def export_contents_csv(
     db: Session = Depends(get_db), tid: int = Depends(team_id)
 ):
     rows = all_contents(db, tid)
+    performances = {
+        item.id: item.title
+        for item in db.scalars(
+            select(PerformanceBooking).where(PerformanceBooking.team_id == tid)
+        ).all()
+    }
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow(
@@ -2381,6 +3569,8 @@ def export_contents_csv(
             "到场人数",
             "售票数",
             "评论摘录",
+            "关联演出",
+            "工作流状态",
         ]
     )
     for item in rows:
@@ -2408,6 +3598,8 @@ def export_contents_csv(
                 item.attendance,
                 item.tickets,
                 item.comment_text,
+                performances.get(item.performance_id, ""),
+                item.workflow_state,
             ]
         )
     return Response(

@@ -30,6 +30,7 @@ class ContentIn(BaseModel):
     source: str = "manual"
     lifecycle: str = "已发布"
     materials: str = ""
+    cover_url: str = ""
     owner: str = ""
     notes: str = ""
     profile_visits: int = Field(default=0, ge=0)
@@ -39,6 +40,19 @@ class ContentIn(BaseModel):
     comment_text: str = ""
     adopted: bool = False
     recommendation_id: str | None = None
+    performance_id: str | None = None
+    owner_user_id: int | None = None
+    workflow_state: str = "待制作"
+
+    @field_validator("workflow_state")
+    @classmethod
+    def validate_workflow_state(cls, value: str) -> str:
+        """Accept only the application's configured workflow states."""
+        from backend.status import WORKFLOW_STATES
+
+        if value not in WORKFLOW_STATES:
+            raise ValueError("内容工作流状态无效")
+        return value
 
     @field_validator("lifecycle", mode="before")
     @classmethod
@@ -58,6 +72,21 @@ class RuleIn(BaseModel):
     conditions: list[dict[str, Any]] = Field(default_factory=list)
     scope: dict[str, Any] = Field(default_factory=dict)
     actions: list[dict[str, Any]] = Field(default_factory=list)
+    rule_type: str = "required"
+    rule_content: dict[str, Any] = Field(default_factory=dict)
+    content_type: str = ""
+    workflow_state: str = ""
+    notes: str = ""
+
+    @field_validator("workflow_state")
+    @classmethod
+    def validate_rule_workflow_scope(cls, value: str) -> str:
+        """Require scoped rule states to use the shared workflow enum."""
+        from backend.status import WORKFLOW_STATES
+
+        if value and value not in WORKFLOW_STATES:
+            raise ValueError("规则适用工作流状态无效")
+        return value
 
 
 class BulkContentIn(BaseModel):
@@ -92,11 +121,30 @@ class TeamIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
 
+class PerformanceIn(BaseModel):
+    """A booked performance managed by a team."""
+
+    title: str = Field(min_length=1, max_length=300)
+    venue: str = Field(default="", max_length=200)
+    starts_at: datetime
+    booking_status: str = "已确认"
+    owner_user_id: int | None = None
+    notes: str = ""
+
+
 class AdoptIn(BaseModel):
     """Recommendation items selected for the publication schedule."""
 
     recommendation_id: str
     items: list[dict[str, Any]]
+
+
+class ManualScheduleIn(BaseModel):
+    """A user-selected publication time for one unpublished content asset."""
+
+    content_id: str
+    planned_date: datetime
+    planned_time: str = Field(pattern=r"^\d{2}:\d{2}$")
 
 
 class PublishIn(BaseModel):

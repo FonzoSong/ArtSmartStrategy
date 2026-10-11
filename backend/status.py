@@ -5,6 +5,15 @@ from __future__ import annotations
 
 from typing import Any
 
+WORKFLOW_STATES = (
+    "待制作",
+    "已制作",
+    "待排期",
+    "已排期",
+    "已发布",
+    "未发布",
+)
+
 
 def normalize_content_status(value: Any) -> str:
     """Map historical content statuses to the supported status set.

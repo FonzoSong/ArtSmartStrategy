@@ -9,10 +9,13 @@ from pathlib import Path
 
 import pytest
 from backend.database import Base
+from backend.example_data import load_example_data
 from backend.models import Content, Team
 from backend.seeding import (
+    SEED_SOURCE,
     confirm_seed_over_existing,
     load_seed_fixture,
+    seed_example_team,
     seed_team,
 )
 from sqlalchemy import create_engine, select
@@ -47,6 +50,29 @@ def test_seed_requires_existing_team(session: Session) -> None:
     """A non-default team must exist before it can receive fixture records."""
     with pytest.raises(ValueError, match="团队 99 不存在"):
         seed_team(session, 99, [])
+
+
+def test_example_seed_injects_120_linked_records_idempotently(
+    session: Session,
+) -> None:
+    """The real database seed preserves relationships and can be rerun."""
+    payload = load_example_data()
+
+    assert seed_example_team(session, 1, payload) == 120
+    assert seed_example_team(session, 1, payload) == 0
+    rows = session.scalars(
+        select(Content).where(Content.source == SEED_SOURCE)
+    ).all()
+    assert len(rows) == 120
+    assert all(row.owner_user_id and row.performance_id for row in rows)
+    assert {row.workflow_state for row in rows} >= {
+        "待制作",
+        "已制作",
+        "待排期",
+        "已排期",
+        "已发布",
+        "未发布",
+    }
 
 
 @pytest.mark.parametrize(("answer", "expected"), [("y", True), ("n", False)])

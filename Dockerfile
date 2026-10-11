@@ -10,6 +10,7 @@ COPY alembic.ini .
 COPY frontend ./frontend
 COPY scripts ./scripts
 COPY rules ./rules
+COPY example ./example
 COPY tests/fixtures ./tests/fixtures
 RUN mkdir -p /app/data
 VOLUME ["/app/data"]

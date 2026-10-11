@@ -8,41 +8,85 @@ from backend import main
 from fastapi import HTTPException
 
 
-def test_startup_creates_schema_without_inserting_business_rows(
+def test_startup_only_verifies_schema_and_does_not_run_migrations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Startup creates ORM tables and does not open a data-seeding session."""
-    created: list[object] = []
+    """Only the dedicated migration entrypoint may execute Alembic upgrades."""
+    calls: list[str] = []
+    monkeypatch.setattr(main, "DATABASE_CONFIGURED", True)
+    monkeypatch.setattr(main, "DATABASE_REQUIRED", True)
     monkeypatch.setattr(
-        main.Base.metadata, "create_all", lambda engine: created.append(engine)
+        main, "verify_database_ready", lambda: calls.append("verify")
     )
+    monkeypatch.setattr(main, "use_database_mode", lambda: None)
     main.startup()
 
-    assert created == [main.engine]
+    assert calls == ["verify"]
 
 
-def test_rules_get_reads_project_file_without_allowing_writes() -> None:
-    """The list route stays readable while write routes are read-only guards."""
-    rows = main.list_rules(None, 1, "viewer")
-    assert rows
-    assert rows[0]["name"]
+def test_startup_refuses_to_serve_an_unmigrated_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Schema errors propagate instead of starting in example mode."""
+    from backend.database import DatabaseSchemaError
 
-    with pytest.raises(HTTPException) as create_error:
-        main.create_rule(None, None, 1, "owner")
-    assert create_error.value.status_code == 405
+    monkeypatch.setattr(main, "DATABASE_CONFIGURED", True)
+    monkeypatch.setattr(main, "DATABASE_REQUIRED", True)
+    monkeypatch.setattr(
+        main,
+        "verify_database_ready",
+        lambda: (_ for _ in ()).throw(DatabaseSchemaError("migration missing")),
+    )
+    monkeypatch.setattr(
+        main,
+        "use_example_mode",
+        lambda: pytest.fail("unmigrated database must not start example mode"),
+    )
 
-    with pytest.raises(HTTPException) as update_error:
-        main.update_rule(1, {}, None, 1, "owner")
-    assert update_error.value.status_code == 405
+    with pytest.raises(DatabaseSchemaError, match="migration missing"):
+        main.startup()
 
-    with pytest.raises(HTTPException) as delete_error:
-        main.delete_rule(1, None, 1, "owner")
-    assert delete_error.value.status_code == 405
+
+def test_rules_are_team_scoped_and_editable():
+    """Managed rules support CRUD and reject duplicate active priorities."""
+    from backend.database import Base
+    from backend.schemas import RuleIn
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        rows = main.list_rules(db, 1, "viewer")
+        assert rows == []
+        claims = {"user_id": 1, "name": "规则维护者"}
+        payload = RuleIn(
+            name="标题长度检查",
+            rule_type="length",
+            rule_content={"min": 1, "max": 120},
+            priority=20,
+        )
+        created = main.create_rule(payload, db, 1, claims, "owner")
+        assert created["name"] == "标题长度检查"
+        assert created["rule_content"] == {"min": 1, "max": 120}
+        assert main.list_rules(db, 1, "viewer")[0]["id"] == created["id"]
+        with pytest.raises(HTTPException) as conflict:
+            main.create_rule(payload, db, 1, claims, "owner")
+        assert conflict.value.status_code == 409
+        updated = main.update_rule(
+            created["id"], {"enabled": False}, db, 1, claims, "owner"
+        )
+        assert updated["enabled"] is False
+        assert main.delete_rule(created["id"], db, 1, claims, "owner") == {
+            "deleted": True
+        }
 
 
 def test_content_status_database_constraint_is_registered() -> None:
     """ORM metadata prevents ambiguous lifecycle values at persistence time."""
-    content_table = main.Base.metadata.tables["content"]
+    from backend.database import Base
+
+    content_table = Base.metadata.tables["content"]
     checks = {
         constraint.name: str(constraint.sqltext)
         for constraint in content_table.constraints

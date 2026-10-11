@@ -15,6 +15,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -70,6 +71,10 @@ class Content(Base):
             "lifecycle IN ('已发布', '未发布')",
             name="ck_content_lifecycle_two_states",
         ),
+        CheckConstraint(
+            "workflow_state IN ('待制作', '已制作', '待排期', '已排期', '已发布', '未发布')",
+            name="ck_content_workflow_state_values",
+        ),
     )
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
@@ -91,6 +96,7 @@ class Content(Base):
     source: Mapped[str] = mapped_column(String(30), default="manual")
     lifecycle: Mapped[str] = mapped_column(String(20), default="已发布")
     materials: Mapped[str] = mapped_column(Text, default="")
+    cover_url: Mapped[str] = mapped_column(Text, default="")
     owner: Mapped[str] = mapped_column(String(100), default="")
     notes: Mapped[str] = mapped_column(Text, default="")
     profile_visits: Mapped[int] = mapped_column(Integer, default=0)
@@ -101,6 +107,15 @@ class Content(Base):
     adopted: Mapped[bool] = mapped_column(Boolean, default=False)
     recommendation_id: Mapped[str | None] = mapped_column(
         ForeignKey("recommendation.id"), nullable=True
+    )
+    performance_id: Mapped[str | None] = mapped_column(
+        ForeignKey("performance_booking.id"), nullable=True, index=True
+    )
+    owner_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("user_account.id"), nullable=True, index=True
+    )
+    workflow_state: Mapped[str] = mapped_column(
+        String(20), default="待制作", index=True
     )
     created_by: Mapped[str] = mapped_column(String(100), default="团队运营者")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now)
@@ -113,10 +128,38 @@ class Tag(Base):
     """A team-scoped content tag."""
 
     __tablename__ = "tag"
+    __table_args__ = (
+        UniqueConstraint(
+            "team_id", "normalized_name", name="uq_tag_team_normalized_name"
+        ),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     team_id: Mapped[int] = mapped_column(ForeignKey("team.id"), index=True)
     name: Mapped[str] = mapped_column(String(50))
+    normalized_name: Mapped[str] = mapped_column(String(100), default="")
     color: Mapped[str] = mapped_column(String(20), default="#647383")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("user_account.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now)
+
+
+class PerformanceBooking(Base):
+    """A booked performance linked to its promotional content assets."""
+
+    __tablename__ = "performance_booking"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("team.id"), index=True)
+    title: Mapped[str] = mapped_column(String(300))
+    venue: Mapped[str] = mapped_column(String(200), default="")
+    starts_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    booking_status: Mapped[str] = mapped_column(String(30), default="已确认")
+    owner_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("user_account.id"), nullable=True, index=True
+    )
+    notes: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now)
 
 
 class ContentTag(Base):
@@ -147,6 +190,10 @@ class Recommendation(Base):
     )
     confidence: Mapped[str] = mapped_column(String(20), default="low")
     reference_count: Mapped[int] = mapped_column(Integer, default=0)
+    analysis_status: Mapped[str] = mapped_column(
+        String(40), default="rules_only"
+    )
+    fallback_reason: Mapped[str] = mapped_column(Text, default="")
     adopted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -172,6 +219,10 @@ class Schedule(Base):
     owner: Mapped[str] = mapped_column(String(100), default="")
     reason: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(20), default="待发布")
+    source: Mapped[str] = mapped_column(String(20), default="automatic")
+    created_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("user_account.id"), nullable=True
+    )
     actual_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
     actual_likes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     actual_comments: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -187,6 +238,9 @@ class Schedule(Base):
         Integer, nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utc_now, onupdate=_utc_now
+    )
 
 
 class AIConfig(Base):
@@ -281,6 +335,17 @@ class ContentRule(Base):
     conditions_json: Mapped[str] = mapped_column(Text, default="[]")
     scope_json: Mapped[str] = mapped_column(Text, default="{}")
     actions_json: Mapped[str] = mapped_column(Text, default="[]")
+    rule_type: Mapped[str] = mapped_column(String(40), default="required")
+    rule_content: Mapped[str] = mapped_column(Text, default="{}")
+    content_type: Mapped[str] = mapped_column(String(40), default="")
+    workflow_state: Mapped[str] = mapped_column(String(20), default="")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    created_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("user_account.id"), nullable=True
+    )
+    updated_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("user_account.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=_utc_now, onupdate=_utc_now
@@ -301,4 +366,22 @@ class RuleExecutionLog(Base):
     trigger: Mapped[str] = mapped_column(String(40), default="")
     result: Mapped[str] = mapped_column(String(20), default="no_match")
     detail: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now)
+
+
+class ContentWorkflowEvent(Base):
+    """Audit one workflow transition for a team's content asset."""
+
+    __tablename__ = "content_workflow_event"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("team.id"), index=True)
+    content_id: Mapped[str] = mapped_column(
+        ForeignKey("content.id", ondelete="CASCADE"), index=True
+    )
+    from_state: Mapped[str] = mapped_column(String(20))
+    to_state: Mapped[str] = mapped_column(String(20))
+    source: Mapped[str] = mapped_column(String(20))
+    actor_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("user_account.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now)
