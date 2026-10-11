@@ -41,7 +41,6 @@ with psycopg.connect(
         cur.execute("CREATE SCHEMA public")
 
 env = os.environ.copy()
-env["SEED_ON_START"] = "true"
 subprocess.run(
     [sys.executable, "-m", "alembic", "upgrade", "head"],
     cwd=ROOT,
@@ -49,5 +48,5 @@ subprocess.run(
     check=True,
 )
 print(
-    "数据库已清空并完成 Alembic 迁移。启动应用后将初始化演示内容；登录注册数据已全部重置。"
+    "数据库已清空并完成 Alembic 迁移；启动后为空库，请通过 Web 创建团队账号。"
 )

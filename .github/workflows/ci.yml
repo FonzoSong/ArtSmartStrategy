@@ -28,7 +28,6 @@ jobs:
     env:
       DATABASE_URL: postgresql+psycopg://arts_smart:ci-password@localhost:5432/arts_smart
       APP_SECRET: ci-only-secret-not-for-deployment
-      SEED_ON_START: "false"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

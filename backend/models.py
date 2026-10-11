@@ -8,6 +8,7 @@ from datetime import date, datetime, timezone
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -64,6 +65,12 @@ class Content(Base):
     """A content asset and its published performance measurements."""
 
     __tablename__ = "content"
+    __table_args__ = (
+        CheckConstraint(
+            "lifecycle IN ('已发布', '未发布')",
+            name="ck_content_lifecycle_two_states",
+        ),
+    )
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )

@@ -4,94 +4,24 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from typing import Any
 
-from fastapi import HTTPException
-from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend.content import sync_tag_links
-from backend.models import Content, ContentRule, RuleExecutionLog
-from backend.schemas import RuleIn
-from backend.settings import CATEGORIES
+from backend.models import Content, RuleExecutionLog
+from backend.scheduler.rules_loader import load_rule_set_safe
 from backend.status import normalize_content_status
 
-RULE_FIELDS = {
-    "platform",
-    "category",
-    "lifecycle",
-    "views",
-    "likes",
-    "comments",
-    "completion",
-    "owner",
-    "source",
-}
-RULE_OPERATORS = {"eq", "neq", "contains", "gt", "gte", "lt", "lte"}
-RULE_ACTIONS = {
-    "set_status",
-    "add_tag",
-    "set_owner",
-    "append_note",
-    "set_category",
-}
-RULE_TRIGGERS = {"content.create", "content.update", "content.import", "manual"}
+
+def _rule_value(rule: Mapping[str, Any], key: str) -> Any:
+    """Read a property from a schema-validated JSON rule."""
+    return rule[key]
 
 
-def validate_rule_payload(data: RuleIn) -> None:
-    """Reject unsupported conditions, scopes, and actions.
-
-    Args:
-        data: Rule definition submitted through the API.
-
-    Raises:
-        HTTPException: If any rule component is outside the supported schema.
-    """
-    if data.trigger not in RULE_TRIGGERS:
-        raise HTTPException(422, "触发时机不支持")
-    if data.logic not in {"all", "any"}:
-        raise HTTPException(422, "条件组合只能是且（all）或或（any）")
-    for condition in data.conditions:
-        if (
-            condition.get("field") not in RULE_FIELDS
-            or condition.get("operator") not in RULE_OPERATORS
-            or "value" not in condition
-        ):
-            raise HTTPException(422, "规则条件字段、运算符或比较值无效")
-    for field in ("platforms", "categories", "statuses"):
-        value = data.scope.get(field, [])
-        if not isinstance(value, list) or any(
-            not isinstance(item, str) for item in value
-        ):
-            raise HTTPException(422, f"生效范围 {field} 必须为字符串数组")
-    if any(
-        value not in {"已发布", "未发布"}
-        for value in data.scope.get("statuses", [])
-    ):
-        raise HTTPException(422, "生效范围状态只能是已发布或未发布")
-    for action in data.actions:
-        if action.get("type") not in RULE_ACTIONS or "value" not in action:
-            raise HTTPException(422, "规则动作类型或动作值无效")
-        if action["type"] == "set_status" and action["value"] not in {
-            "已发布",
-            "未发布",
-        }:
-            raise HTTPException(422, "规则状态动作只能设置为已发布或未发布")
-        if (
-            action["type"] == "set_category"
-            and action["value"] not in CATEGORIES
-        ):
-            raise HTTPException(422, "内容类型动作值不在可选范围内")
-        if (
-            action["type"] in {"add_tag", "set_owner", "append_note"}
-            and not str(action["value"]).strip()
-        ):
-            raise HTTPException(422, "文本类规则动作值不能为空")
-    if not data.actions:
-        raise HTTPException(422, "至少配置一个执行动作")
-
-
-def rule_matches(rule: ContentRule, content: Content) -> bool:
+def rule_matches(rule: Mapping[str, Any], content: Content) -> bool:
     """Evaluate whether a rule's scope and conditions match content.
 
     Args:
@@ -101,7 +31,7 @@ def rule_matches(rule: ContentRule, content: Content) -> bool:
     Returns:
         Whether the content is within the rule scope and satisfies its logic.
     """
-    scope = json.loads(rule.scope_json or "{}")
+    scope = _rule_value(rule, "scope")
     if scope.get("platforms") and content.platform not in scope["platforms"]:
         return False
     if scope.get("categories") and content.category not in scope["categories"]:
@@ -111,7 +41,7 @@ def rule_matches(rule: ContentRule, content: Content) -> bool:
         and normalize_content_status(content.lifecycle) not in scope["statuses"]
     ):
         return False
-    conditions = json.loads(rule.conditions_json or "[]")
+    conditions = _rule_value(rule, "conditions")
     if not conditions:
         return True
     values = []
@@ -137,13 +67,16 @@ def rule_matches(rule: ContentRule, content: Content) -> bool:
             except (TypeError, ValueError):
                 matched = False
         values.append(matched)
-    return all(values) if rule.logic == "all" else any(values)
+    return all(values) if _rule_value(rule, "logic") == "all" else any(values)
 
 
 def execute_content_rules(
-    db: Session, tid: int, content: Content, trigger: str
+    db: Session,
+    tid: int,
+    content: Content,
+    trigger: str,
 ) -> list[RuleExecutionLog]:
-    """Apply enabled rules for a trigger and create execution log entries.
+    """Apply read-only JSON rules for a trigger and log execution results.
 
     Args:
         db: Active database session.
@@ -154,23 +87,25 @@ def execute_content_rules(
     Returns:
         Logs for matched, unmatched, or invalid rule executions.
     """
-    rules = db.scalars(
-        select(ContentRule)
-        .where(
-            ContentRule.team_id == tid,
-            ContentRule.enabled.is_(True),
-            ContentRule.trigger == trigger,
-        )
-        .order_by(ContentRule.priority.desc(), ContentRule.id)
-    ).all()
-    logs = []
+    ruleset = load_rule_set_safe()
+    if ruleset is None:
+        return []
+    rules = sorted(
+        (
+            rule
+            for rule in ruleset["rules"]
+            if rule["enabled"] and rule["trigger"] == trigger
+        ),
+        key=lambda rule: (-rule["priority"], rule["name"]),
+    )
+    logs: list[RuleExecutionLog] = []
     for rule_item in rules:
         result = "no_match"
         details: list[str] = []
         try:
             if rule_matches(rule_item, content):
                 result = "matched"
-                for action in json.loads(rule_item.actions_json or "[]"):
+                for action in _rule_value(rule_item, "actions"):
                     kind, value = action["type"], action["value"]
                     if kind == "set_status":
                         content.lifecycle = normalize_content_status(value)
@@ -202,8 +137,8 @@ def execute_content_rules(
             details.append(f"执行异常：{str(exc)[:300]}")
         log = RuleExecutionLog(
             team_id=tid,
-            rule_id=rule_item.id,
-            rule_name=rule_item.name,
+            rule_id=rule_item.get("id"),
+            rule_name=_rule_value(rule_item, "name"),
             content_id=content.id,
             trigger=trigger,
             result=result,

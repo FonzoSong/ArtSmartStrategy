@@ -9,5 +9,9 @@ COPY migrations ./migrations
 COPY alembic.ini .
 COPY frontend ./frontend
 COPY scripts ./scripts
+COPY rules ./rules
+COPY tests/fixtures ./tests/fixtures
+RUN mkdir -p /app/data
+VOLUME ["/app/data"]
 EXPOSE 8000
 CMD ["python", "-m", "backend.container_entrypoint"]

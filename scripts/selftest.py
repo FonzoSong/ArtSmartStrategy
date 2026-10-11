@@ -17,10 +17,11 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 if not os.getenv("DATABASE_URL", "").startswith("postgresql"):
     raise SystemExit("请先配置 PostgreSQL DATABASE_URL，再运行 selftest.py")
-os.environ["SEED_ON_START"] = "true"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from backend.database import SessionLocal  # noqa: E402
 from backend.main import app  # noqa: E402
+from backend.seeding import load_seed_fixture, seed_team  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 
@@ -91,6 +92,10 @@ def run():
             },
         )
         check("first-run administrator setup", setup.status_code == 200)
+        fixture = load_seed_fixture()
+        with SessionLocal() as db:
+            seeded = seed_team(db, setup.json()["user"]["team_id"], fixture)
+        check("explicit test-fixture injection", seeded == 3)
         client.headers.update(
             {
                 "Authorization": "Bearer " + setup.json()["access_token"],
@@ -117,12 +122,11 @@ def run():
             platform_stats["items"][0]["total_views"] is not None
             and platform_stats["items"][0]["total_views"] > 0,
         )
-        rule = client.post("/api/ai/recommend").json()
+        empty_suggestions = client.post("/api/ai/recommend").json()
         check(
-            "model-free recommendation fallback",
-            rule["source"] == "rule"
-            and "规则分析" in rule["source_label"]
-            and len(rule["recommendations"]) == 3,
+            "published history alone does not create draft targets",
+            empty_suggestions["source"] == "ruleset-v0.4"
+            and empty_suggestions["recommendations"] == [],
         )
         record = {
             "title": "排练细节｜动作拆解练习",
@@ -159,42 +163,20 @@ def run():
             "tag dictionary receives content tags",
             any(x["name"] == "排练" for x in client.get("/api/tags").json()),
         )
-        rule_data = {
-            "name": "高播放内容自动标记",
-            "priority": 200,
-            "enabled": True,
-            "trigger": "content.create",
-            "logic": "all",
-            "conditions": [
-                {"field": "views", "operator": "gte", "value": 1000},
-                {"field": "completion", "operator": "gte", "value": 60},
-            ],
-            "scope": {
-                "platforms": ["短视频平台B"],
-                "categories": [],
-                "statuses": [],
-            },
-            "actions": [
-                {"type": "add_tag", "value": "规则命中"},
-                {"type": "set_status", "value": "未发布"},
-            ],
-        }
-        rule = client.post("/api/rules", json=rule_data)
-        check("create combined scoped content rule", rule.status_code == 200)
-        conflict_data = {
-            **rule_data,
-            "name": "冲突规则",
-            "actions": [{"type": "add_tag", "value": "不同标签"}],
-        }
         check(
-            "conflicting equal-priority rule rejected",
-            client.post("/api/rules", json=conflict_data).status_code == 409,
+            "read-only rules are loaded from the project JSON",
+            any(
+                item["name"] == "高表现内容进入复盘池"
+                for item in client.get("/api/rules").json()
+            ),
         )
-        matched_record = {
-            **record,
-            "title": "规则命中内容",
-            "platform": "短视频平台B",
-        }
+        existing_rule = client.get("/api/rules").json()[0]
+        existing_rule.pop("id")
+        check(
+            "application cannot create custom rules",
+            client.post("/api/rules", json=existing_rule).status_code == 405,
+        )
+        matched_record = {**record, "title": "规则命中内容"}
         matched_create = client.post("/api/contents", json=matched_record)
         matched_item = (
             matched_create.json()["item"]
@@ -204,8 +186,8 @@ def run():
         check(
             "rule actions apply on content create",
             matched_create.status_code == 200
-            and matched_item["lifecycle"] == "未发布"
-            and "规则命中" in matched_item["tags"],
+            and matched_item["lifecycle"] == "已发布"
+            and "高表现待复盘" in matched_item["tags"],
         )
         no_match_record = {
             **record,
@@ -222,32 +204,43 @@ def run():
                 for x in client.get("/api/rules/logs").json()
             ),
         )
-        manual_rule = {
-            "name": "手动指定负责人",
-            "priority": 50,
-            "enabled": True,
-            "trigger": "manual",
-            "logic": "all",
-            "conditions": [],
-            "scope": {},
-            "actions": [{"type": "set_owner", "value": "规则负责人"}],
-        }
-        saved_manual = client.post("/api/rules", json=manual_rule)
-        evaluated = client.post("/api/rules/evaluate", json={"content_id": cid})
+        draft = client.post(
+            "/api/contents",
+            json={
+                **record,
+                "title": "等待排期的未发布内容",
+                "lifecycle": "未发布",
+                "views": 0,
+                "completion": 0,
+                "owner": "",
+            },
+        ).json()["item"]
+        suggestions = client.post("/api/ai/recommend").json()
         check(
-            "manual rule trigger and action",
-            saved_manual.status_code == 200
-            and evaluated.status_code == 200
-            and evaluated.json()["matched"] == 1
-            and client.get(f"/api/contents/{cid}").json()["owner"]
-            == "规则负责人",
+            "ruleset schedules an unpublished content asset",
+            len(suggestions["recommendations"]) == 1
+            and suggestions["recommendations"][0]["target_content_id"]
+            == draft["id"],
         )
-        toggle = client.patch(
-            f"/api/rules/{rule.json()['id']}", json={"enabled": False}
+        evaluated = client.post(
+            "/api/rules/evaluate", json={"content_id": draft["id"]}
         )
         check(
-            "rule can be disabled",
-            toggle.status_code == 200 and toggle.json()["enabled"] is False,
+            "read-only JSON rules still execute manually",
+            evaluated.status_code == 200 and evaluated.json()["matched"] >= 1,
+        )
+        check(
+            "unpublished assets do not enter overview post count",
+            client.get("/api/stats/overview").json()["unpublished_count"] == 0
+            and client.get("/api/stats/overview").json()["total_posts"]
+            == client.get("/api/stats/overview").json()["total_assets"],
+        )
+        check(
+            "unpublished assets appear as operational todos",
+            any(
+                "未发布内容" in item["item"]
+                for item in client.get("/api/handover").json()["todo_items"]
+            ),
         )
         csv = '平台,发布时间,标题,播放量,点赞量,看完比例,状态标签,责任人,主页访问\n短视频平台A,2026-10-07 18:00,"CSV 导入, 标题",1250,90,65,,张老师,28\n'
         imp = client.post(
@@ -284,8 +277,8 @@ def run():
             "legacy status input maps to unpublished and stats exclude it",
             status_change.status_code == 200
             and status_change.json()["lifecycle"] == "未发布"
+            and overview_status["unpublished_count"] == 0
             and overview_status["total_posts"]
-            + overview_status["unpublished_count"]
             == overview_status["total_assets"],
         )
         bulk = client.post(
@@ -381,7 +374,7 @@ def run():
             ).status_code
             == 403,
         )
-        # Exercise actual server-proxied model generation against a local mock server.
+        # Model credentials remain available for insight and connectivity checks.
         config = client.get("/api/settings").json()
         config.update(
             {
@@ -399,9 +392,9 @@ def run():
         )
         live = client.post("/api/ai/recommend").json()
         check(
-            "AI recommendation proxy and JSON parsing",
-            live["source"] == "selftest-model"
-            and live["recommendations"][0]["title"] == "从一次练习开始讲起",
+            "recommendation remains constrained by the read-only ruleset",
+            live["source"] == "ruleset-v0.4"
+            and live["recommendations"][0]["target_content_id"] == draft["id"],
         )
         adopted = client.post(
             "/api/schedule/adopt",
@@ -417,7 +410,7 @@ def run():
         sched = client.get("/api/schedule").json()[0]
         check(
             "schedule read after adoption",
-            sched["title"] == "从一次练习开始讲起" and "owner" in sched,
+            sched["content_id"] == draft["id"] and "owner" in sched,
         )
         month_start = sched["planned_date"][:7] + "-01"
         month_end = sched["planned_date"]

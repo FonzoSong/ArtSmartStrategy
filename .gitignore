@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 data/*.db
 data/*.sqlite*
+postgres-data/
 *.pdf
 *.png
 *.log

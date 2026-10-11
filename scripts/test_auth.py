@@ -15,7 +15,6 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 if not os.getenv("DATABASE_URL", "").startswith("postgresql"):
     raise SystemExit("请先配置 PostgreSQL DATABASE_URL")
-os.environ["SEED_ON_START"] = "false"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.database import SessionLocal  # noqa: E402

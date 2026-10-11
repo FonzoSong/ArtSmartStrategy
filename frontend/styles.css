@@ -43,10 +43,6 @@ body.auth-mode .main-area{margin-left:0;width:100%}body.auth-mode .topbar-right{
 .month-grid .calendar-event small{font-size:8px;display:block;margin-top:3px}
 .month-grid .event-actions{font-size:8px;gap:5px}
 .schedule-state{color:#8d7058}
-.rule-form{border:1px solid var(--line);border-radius:8px;padding:14px;margin:12px 0}
-.rule-form textarea,.rule-form input:not([type=checkbox]),.rule-form select{width:100%;border:1px solid #ded6c8;background:#faf8f1;border-radius:6px;padding:9px;color:#514b42}
-.rule-form small{font-size:9px;color:var(--muted);line-height:1.6}
-.rule-enabled{display:flex;align-items:center;gap:7px;font-size:11px;color:#665e52}
 .rule-list{display:grid;gap:7px;margin-top:12px}
 .rule-row{display:flex;align-items:center;gap:8px;border-bottom:1px solid #eee8dc;padding:9px 0}
 .rule-row>div{flex:1;min-width:160px}.rule-row b,.rule-row small{display:block}.rule-row small{margin-top:4px;color:var(--muted);font-size:9px}
