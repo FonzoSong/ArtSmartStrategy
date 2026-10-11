@@ -2,14 +2,19 @@
 
 艺数智策是面向艺术团队的内容运营复盘网站。它使用团队主动录入的数据分析内容表现、形成排期建议并记录发布后的反馈。应用以 PostgreSQL 保存业务数据，面向 Windows 提供批处理启动脚本，也支持 Docker Compose 部署。首次初始化会写入 3 条模拟记录；删除后不会在重启时自动恢复。
 
+项目采用 Apache-2.0 许可证。开发者可通过 `pip install -e ".[dev]"` 安装开发依赖，使用 Ruff、mypy 和 pytest 检查代码；贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
 ## Windows 本地启动
 
-准备 Windows 10/11、Python 3.11 或更新版本及 Python Launcher（`py` 命令），并安装 PostgreSQL 16 或兼容版本。安装 PostgreSQL 时记下端口、用户名和密码，并确保数据库服务已启动。
+准备 Windows 10/11、Python 3.10 或更新版本及 Python Launcher（`py` 命令），并安装 PostgreSQL 16 或兼容版本。安装 PostgreSQL 时记下端口、用户名和密码，并确保数据库服务已启动。
 
 1. 在项目目录复制 `.env.example` 并命名为 `.env`。也可以直接双击 `start.bat`，它会首次创建 `.env` 并打开记事本。
 2. 修改 `.env` 中的 `DATABASE_URL`，填写本机 PostgreSQL 用户、密码、地址和数据库名；将 `APP_SECRET` 改成较长的随机字符串。数据库用户需要创建数据库的权限，首次运行脚本会在数据库不存在时尝试创建。
 3. 保存 `.env` 后双击 `start.bat`。脚本会创建 Python 虚拟环境、安装依赖、准备数据库、应用迁移并启动网站。
 4. 浏览器访问 <http://127.0.0.1:8000>。首次访问时创建团队负责人账号。
+
+应用运行、登录注册和测试脚本均只支持 PostgreSQL，不再接受 SQLite 连接串。
+项目中的 `data/arts_smart.db` 是历史 SQLite 文件，当前应用不会读取它；删除该文件不会重置 Docker 数据库。Docker 数据实际存放在 `postgres-data` 命名卷中。
 
 示例连接串：
 
@@ -62,11 +67,25 @@ docker compose up --build
 .venv\Scripts\python.exe -m alembic upgrade head
 ```
 
-隔离式端到端自测使用临时 SQLite 文件和本地模拟模型服务，不会修改 PostgreSQL 正式数据，也不需要真实模型密钥。完成依赖安装后运行：
+端到端自测使用当前配置的 PostgreSQL 数据库，请使用专用测试库或测试环境，完成依赖安装后运行：
 
 ```bat
 .venv\Scripts\python.exe scripts\selftest.py
 ```
+
+认证专项测试：
+
+```bat
+.venv\Scripts\python.exe scripts\test_auth.py
+```
+
+重置测试/开发数据库（会清空 `public` schema，需输入 `RESET` 确认）：
+
+```bash
+bash reset.sh
+```
+
+本地 Python 环境会直接连接 `.env` 中的 PostgreSQL；如果没有 `.venv` 但检测到 Docker Compose，脚本会删除并重建 Compose 的 `postgres-data` 命名卷，再用本地已有镜像启动服务，不拉取镜像、不需要外网。Windows 可在 Git Bash 或 WSL 中执行；生产数据库请先备份再使用。
 
 通过时会显示检查通过的总数。API 健康状态位于 `/api/health`，交互式 API 文档位于 `/docs`。
 

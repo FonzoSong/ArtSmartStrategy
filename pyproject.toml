@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arts-smart-strategy"
+version = "1.0.0"
+description = "Content operations review system for arts teams"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+  "alembic>=1.15,<2",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "pandas>=2.2,<3",
+  "psycopg[binary]>=3.2,<4",
+  "python-dotenv>=1.1,<2",
+  "python-multipart>=0.0.20,<1",
+  "reportlab>=4.4,<5",
+  "SQLAlchemy>=2.0,<3",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.15,<2",
+  "pre-commit>=4.2,<5",
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.11,<1",
+]
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
+
+[tool.ruff]
+line-length = 80
+target-version = "py310"
+src = ["backend", "scripts", "migrations", "tests"]
+extend-exclude = ["NextVersion"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "D"]
+ignore = ["D100", "D104", "D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Legacy route handlers are being documented as they move into domain modules.
+"backend/main.py" = ["D"]
+"migrations/**/*.py" = ["D"]
+"scripts/**/*.py" = ["D"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+files = ["backend"]
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# The API module is still a legacy boundary; new modules use strict checking.
+module = ["backend.main"]
+disable_error_code = [
+  "no-untyped-def",
+  "no-untyped-call",
+  "type-arg",
+  "no-any-return",
+  "assignment",
+  "arg-type",
+  "attr-defined",
+  "call-arg",
+  "misc",
+  "var-annotated",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = ["integration: requires a PostgreSQL database"]
+
+[tool.coverage.run]
+branch = true
+source = ["backend"]
+# Expand this gate as legacy routes are extracted and covered.
+omit = ["backend/main.py", "backend/container_entrypoint.py"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true
