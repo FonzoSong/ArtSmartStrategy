@@ -1,57 +1,40 @@
 services:
-  db:
-    image: postgres:16-alpine
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-arts_smart}
-      POSTGRES_USER: ${POSTGRES_USER:-arts_smart}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-    volumes:
-      - ./postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "pg_isready -h 127.0.0.1 -p 5432 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\"",
-        ]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 10s
-    restart: unless-stopped
-  migrate:
-    build: .
-    command: ["python", "-m", "backend.container_entrypoint", "prepare"]
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-arts_smart}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-arts_smart}
-      SEED_DATA: ${SEED_DATA:-false}
-      APP_SECRET_FILE: /app/runtime-secret/.env
-    volumes:
-      - ./data:/app/data
-      - app-secret:/app/runtime-secret
-    depends_on:
-      db:
-        condition: service_started
-    restart: "no"
-  artsmart:
-    build: .
-    command: ["python", "-m", "backend.container_entrypoint", "serve"]
+      API_ADDR: ":8080"
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the managed PostgreSQL service}
+      APP_SECRET: ${APP_SECRET:?Set a random APP_SECRET of at least 32 characters}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:8081}
+      AI_BASE_URL: ${AI_BASE_URL:-https://api.kunyou.asia/v1}
+      AI_MODEL: ${AI_MODEL:-qwen3.8-max}
+      AI_API_KEY: ${AI_API_KEY:-}
+      DB_POOL_MAX: ${DB_POOL_MAX:-20}
+      DB_POOL_MIN: ${DB_POOL_MIN:-2}
     ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-arts_smart}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-arts_smart}
-      SEED_DATA: ${SEED_DATA:-false}
-      APP_SECRET_FILE: /app/runtime-secret/.env
-    volumes:
-      - ./data:/app/data
-      - app-secret:/app/runtime-secret
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
+      - "${API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "/app/api", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
 
-volumes:
-  app-secret:
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+    ports:
+      - "${WEB_PORT:-8081}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped

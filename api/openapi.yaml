@@ -1,0 +1,198 @@
+openapi: 3.1.0
+info:
+  title: Artsmart Strategy API
+  version: 0.4.0
+  description: Team-scoped content operations API. PostgreSQL credentials remain server-side.
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /api/health/live:
+    get:
+      security: []
+      summary: Process liveness
+      responses:
+        '200': { description: Service process is alive }
+  /api/health/ready:
+    get:
+      security: []
+      summary: Database readiness
+      responses:
+        '200': { description: Database and schema are ready }
+        '503': { description: Database unavailable }
+  /api/runtime-mode:
+    get:
+      security: []
+      summary: Persistence mode
+      responses:
+        '200': { description: Always reports persistent PostgreSQL mode }
+  /api/auth/status:
+    get:
+      security: []
+      summary: Check whether initial account setup is needed
+      responses:
+        '200': { description: Setup status }
+  /api/auth/setup:
+    post:
+      security: []
+      summary: Create the initial team owner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountSetup' }
+      responses:
+        '201': { description: Access token and account }
+        '409': { description: Owner already exists }
+  /api/auth/register-team:
+    post:
+      security: []
+      summary: Create a team and owner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountSetup' }
+      responses:
+        '201': { description: Access token and account }
+  /api/auth/login:
+    post:
+      security: []
+      summary: Create a session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 10 }
+      responses:
+        '200': { description: Access token and account }
+        '401': { description: Credentials invalid }
+  /api/auth/me:
+    get:
+      summary: Current account
+      responses:
+        '200': { description: Account profile }
+  /api/contents:
+    get:
+      summary: List current-team contents
+      responses:
+        '200': { description: Team content list }
+    post:
+      summary: Create content
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ContentInput' }
+      responses:
+        '201': { description: Created content }
+        '422': { description: Validation error }
+  /api/contents/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      summary: Get one team content
+      responses:
+        '200': { description: Content record }
+        '404': { description: Not found in current team }
+    patch:
+      summary: Update content fields
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Updated content }
+    delete:
+      summary: Delete a content record
+      responses:
+        '204': { description: Deleted }
+  /api/contents/{id}/advance:
+    post:
+      summary: Advance content from pending production to produced
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Workflow advanced }
+        '409': { description: Current state cannot advance }
+  /api/teams:
+    get:
+      summary: Get caller's team
+      responses:
+        '200': { description: One team record }
+  /api/users:
+    get:
+      summary: List current-team users
+      responses:
+        '200': { description: Team members }
+    post:
+      summary: Add a team member; owner only
+      responses:
+        '201': { description: Member created }
+        '403': { description: Owner role required }
+  /api/performances:
+    get:
+      summary: List current-team performance bookings
+      responses:
+        '200': { description: Bookings }
+    post:
+      summary: Create a performance booking
+      responses:
+        '201': { description: Booking created }
+  /api/tags:
+    get:
+      summary: List current-team tags
+      responses:
+        '200': { description: Tag library }
+    post:
+      summary: Create or find a normalized tag
+      responses:
+        '201': { description: Tag record }
+  /api/stats/overview:
+    get:
+      summary: Published-only overview metrics
+      responses:
+        '200': { description: Team statistics }
+  /api/stats/platform:
+    get:
+      summary: Published-only metrics by platform
+      responses:
+        '200': { description: Platform statistics }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    AccountSetup:
+      type: object
+      required: [team_name, name, email, password]
+      properties:
+        team_name: { type: string, maxLength: 100 }
+        name: { type: string, maxLength: 100 }
+        email: { type: string, format: email }
+        password: { type: string, minLength: 10 }
+    ContentInput:
+      type: object
+      required: [title, platform, published_at, lifecycle, workflow_state]
+      properties:
+        title: { type: string, maxLength: 300 }
+        category: { type: string }
+        platform: { type: string }
+        published_at: { type: string, format: date-time }
+        lifecycle: { type: string, enum: [已发布, 未发布] }
+        workflow_state: { type: string, enum: [待制作, 已制作, 待排期, 已排期, 已发布, 未发布] }
+        tags: { type: array, items: { type: string } }

@@ -17,4 +17,6 @@ NextVersion
 htmlcov/
 dist/
 build/
+web/node_modules/
+web/dist/
 *.egg-info/

@@ -1,18 +1,15 @@
-FROM python:3.12-slim
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# SPDX-License-Identifier: Apache-2.0
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api
+
+FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends fonts-noto-cjk fonts-droid-fallback && rm -rf /var/lib/apt/lists/*
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY backend ./backend
-COPY migrations ./migrations
-COPY alembic.ini .
-COPY frontend ./frontend
-COPY scripts ./scripts
-COPY rules ./rules
-COPY example ./example
-COPY tests/fixtures ./tests/fixtures
-RUN mkdir -p /app/data
-VOLUME ["/app/data"]
-EXPOSE 8000
-CMD ["python", "-m", "backend.container_entrypoint"]
+COPY --from=build /out/api /app/api
+EXPOSE 8080
+USER nonroot:nonroot
+ENTRYPOINT ["/app/api"]
