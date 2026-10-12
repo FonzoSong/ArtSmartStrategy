@@ -31,7 +31,7 @@ WITH numbered AS (
             WHEN 0 THEN '已发布'
             WHEN 1 THEN '已发布'
             WHEN 2 THEN '已发布'
-            WHEN 3 THEN '未发布'
+            WHEN 3 THEN '待制作'
             WHEN 4 THEN '待制作'
             WHEN 5 THEN '已制作'
             WHEN 6 THEN '待排期'
@@ -170,3 +170,7 @@ ON CONFLICT DO NOTHING;
 
 INSERT INTO schema_migrations (version) VALUES ('0002_seed_rules')
 ON CONFLICT (version) DO NOTHING;
+
+-- The first team row above uses an explicit id, so advance the id sequence to
+-- keep new team registrations working.
+SELECT setval(pg_get_serial_sequence('team', 'id'), GREATEST(COALESCE((SELECT MAX(id) FROM team), 1), 1));

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 FROM golang:1.26-alpine AS build
 WORKDIR /src
+# Dependencies are vendored so the image builds without a module proxy.
 COPY go.mod go.sum ./
-RUN go mod download
+COPY vendor ./vendor
 COPY cmd ./cmd
 COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api

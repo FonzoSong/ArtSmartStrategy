@@ -128,6 +128,25 @@ paths:
       responses:
         '200': { description: Workflow advanced }
         '409': { description: Current state cannot advance }
+  /api/contents/advance-bulk:
+    post:
+      summary: Advance selected 待制作 records to 已制作 using the single-record rule
+      description: Records that are missing, already moved, or never eligible are reported per record; successful records are committed together.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids: { type: array, maxItems: 200, items: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Per-record results with advanced/failed counts
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowAdvance'}
   /api/teams:
     get:
       summary: Get caller's team
@@ -165,7 +184,21 @@ paths:
     get:
       summary: Published-only overview metrics
       responses:
-        '200': { description: Team statistics }
+        '200':
+          description: Team statistics
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Overview' }
+  /api/rules/system:
+    get:
+      summary: Read-only, versioned system rule set (never editable through the API)
+      responses:
+        '200': { description: System rule sets with their effective flag }
+  /api/schedule/policy:
+    get:
+      summary: Effective scheduling policy and its inclusive planning window
+      responses:
+        '200': { description: 'planning_horizon_days counts natural days starting today, so the window is today .. today + N - 1' }
   /api/stats/platform:
     get:
       summary: Published-only metrics by platform
@@ -177,6 +210,54 @@ components:
       type: http
       scheme: bearer
   schemas:
+    WorkflowAdvance:
+      type: object
+      required: [advanced, failed, results]
+      properties:
+        advanced: { type: integer }
+        failed: { type: integer }
+        results:
+          type: array
+          items:
+            type: object
+            required: [id, status]
+            properties:
+              id: { type: string }
+              title: { type: string }
+              status: { type: string, enum: [advanced, failed] }
+              reason: { type: string, description: Why the record could not advance }
+    Overview:
+      type: object
+      required: [published_count, total_posts, total_views, total_interactions, platform_count, avg_completion, sample_count, top_contents]
+      properties:
+        published_count: { type: integer }
+        unpublished_count: { type: integer }
+        total_posts: { type: integer }
+        total_views: { type: integer }
+        total_likes: { type: integer }
+        total_interactions: { type: integer }
+        platform_count: { type: integer }
+        avg_completion: { type: number, description: 'Percentage value on a 0-100 scale' }
+        sample_count: { type: integer }
+        weights:
+          type: object
+          properties:
+            completion: { type: number }
+            interaction: { type: number }
+        top_contents:
+          type: array
+          description: Published assets ordered by score, then publication time, then id
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              title: { type: string }
+              category: { type: string }
+              platform: { type: string }
+              completion: { type: number, description: 'Percentage value on a 0-100 scale' }
+              interaction_rate: { type: number, description: 'Percentage value on a 0-100 scale' }
+              score: { type: number, description: 'completion * completion weight + interaction rate * interaction weight' }
+              published_at: { type: string, format: date-time }
     AccountSetup:
       type: object
       required: [team_name, name, email, password]

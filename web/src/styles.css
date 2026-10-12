@@ -31,6 +31,45 @@ body.auth-mode .main-area{margin-left:0;width:100%}body.auth-mode .topbar-right{
 .bulk-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--line);margin-bottom:8px}
 .bulk-toolbar b{margin-right:auto;font-size:11px}
 .danger-action{color:#994f3a}
+.btn-primary.danger-action{background:#a5573c;color:#fdf8f2}
+.btn-primary.danger-action:hover{background:#8f4a33}
+.confirm-dialog{width:min(520px,100%)}
+.confirm-description{color:#7c7468;font-size:11px;line-height:1.7;margin:6px 0 0}
+.confirm-details{margin:13px 0 0;padding:11px 13px 11px 28px;background:#f0ece2;border-radius:7px;color:#756d61;font-size:10px;line-height:1.8;max-height:190px;overflow:auto}
+.confirm-error{margin:11px 0 0;padding:9px 11px;border-left:2px solid #a5573c;background:#f6e8e2;color:#8c4a33;font-size:10px;line-height:1.7}
+.confirm-dialog select{width:100%;border:1px solid #ded6c8;background:#faf8f1;border-radius:6px;padding:9px 10px;color:#39352e;font-size:12px}
+.confirm-dialog .form-field{margin-top:12px}
+.confirm-fields{margin-top:14px}
+.confirm-fields .form-field span{font-size:11px;color:#756d60}
+.schedule-batch{margin-top:13px;max-height:46vh;overflow:auto;border:1px solid #e6dfd1;border-radius:8px}
+.schedule-batch .data-table{min-width:640px}
+.schedule-batch .data-table th{position:sticky;top:0;background:#f2eee4;z-index:1}
+.schedule-batch input,.schedule-batch select{border:1px solid #ded6c8;background:#faf8f1;border-radius:5px;padding:6px 7px;font-size:11px;color:#4a453c;width:100%}
+.dashboard-controls{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;padding:14px 16px;border:1px solid #e3dccd;border-radius:10px;background:#fbf9f2e8;box-shadow:var(--shadow);margin-bottom:16px}
+.dashboard-controls .form-field{min-width:160px;gap:5px}
+.dashboard-controls .form-field span{font-size:10px;color:#8b8275;letter-spacing:.04em}
+.dashboard-controls .form-field select{border:1px solid #ded6c8;background:#fdfbf5;border-radius:6px;padding:8px 9px;font-size:12px;color:#3b3831}
+.dashboard-controls .btn-secondary,.dashboard-controls .btn-primary{margin-left:auto}
+.dashboard-controls .btn-secondary+.btn-primary{margin-left:0}
+.kpi-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:13px;margin-bottom:16px}
+.kpi-card{border:1px solid #e3dccd;border-radius:11px;background:#fbf9f2f2;box-shadow:var(--shadow);padding:15px 16px;display:flex;flex-direction:column;gap:7px}
+.kpi-label{font-size:11px;color:#827a6c;letter-spacing:.03em}
+.kpi-value{font:600 22px var(--sans);letter-spacing:-.03em;color:#33302a}
+.kpi-value em{font:400 12px var(--sans);font-style:normal;color:#797266;letter-spacing:0}
+.kpi-foot{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:10px;color:#a0998c}
+.kpi-change{border-radius:999px;padding:3px 7px;font-size:10px;background:#eeeae0;color:#6d675d}
+.kpi-change.good{background:#e4ece1;color:#4f6a49}
+.kpi-change.bad{background:#f4e5de;color:#8f4b33}
+.kpi-change.muted{background:#efece3;color:#9a9285}
+.dashboard-grid{grid-template-columns:1.45fr 1fr;margin-bottom:15px}
+.workflow-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}
+.workflow-card{border:1px solid #e6dfd1;border-radius:9px;padding:11px 12px;background:#f8f5ed;display:flex;flex-direction:column;gap:5px}
+.workflow-card span{font-size:10px;color:#827a6c}
+.workflow-card b{font:600 19px var(--sans);color:#3b3831}
+.workflow-card.attention{border-color:#dcc6b6;background:#f8efe7}
+.chart-unit{margin:7px 0 0;color:#a0998c;font-size:10px}
+@media(max-width:1280px){.kpi-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}.kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .pagination{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--line);padding-top:13px;margin-top:12px;color:var(--muted);font-size:11px}
 .pagination label{display:flex;align-items:center;gap:6px}.pagination select{border:1px solid #ded6c8;border-radius:5px;padding:5px;background:#faf8f1;color:#514b42}
 .csv-guide{margin-top:9px;color:var(--muted);font-size:11px;line-height:1.7}.csv-guide summary{cursor:pointer;color:var(--blue);font-weight:600}.csv-guide p{margin:6px 0}

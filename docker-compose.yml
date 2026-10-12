@@ -11,7 +11,7 @@ services:
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env}
       LOAD_EXAMPLE_DATA: ${LOAD_EXAMPLE_DATA:-true}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - ./pgdata:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro
       - ./db/sql:/docker-entrypoint-sql:ro
     networks:
@@ -87,6 +87,3 @@ networks:
     driver: bridge
     internal: true
 
-volumes:
-  pgdata:
-    name: arts-smart-postgres-data

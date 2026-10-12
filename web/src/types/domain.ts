@@ -37,3 +37,18 @@ export interface ApiErrorBody {
   detail: string;
   error: { code: string; message: string; request_id: string };
 }
+
+/** Per-record result of `POST /api/contents/advance-bulk`. */
+export interface WorkflowAdvanceResult {
+  id: string;
+  title?: string;
+  status: "advanced" | "failed";
+  reason?: string;
+}
+
+/** Response of `POST /api/contents/advance-bulk`. */
+export interface WorkflowAdvanceOutcome {
+  advanced: number;
+  failed: number;
+  results: WorkflowAdvanceResult[];
+}

@@ -218,7 +218,7 @@ CREATE TABLE IF NOT EXISTS content (
 	updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL, 
 	PRIMARY KEY (id), 
 	CONSTRAINT ck_content_lifecycle_two_states CHECK (lifecycle IN ('已发布', '未发布')), 
-	CONSTRAINT ck_content_workflow_state_values CHECK (workflow_state IN ('待制作', '已制作', '待排期', '已排期', '已发布', '未发布')), 
+	CONSTRAINT ck_content_workflow_state_values CHECK (workflow_state IN ('待制作', '已制作', '待排期', '已排期', '已发布')), 
 	FOREIGN KEY(team_id) REFERENCES team (id), 
 	FOREIGN KEY(recommendation_id) REFERENCES recommendation (id), 
 	FOREIGN KEY(performance_id) REFERENCES performance_booking (id), 

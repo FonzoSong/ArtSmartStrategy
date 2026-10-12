@@ -123,15 +123,17 @@ func (r *Postgres) UpdateContent(
 	if !uuidPattern.MatchString(contentID) {
 		return nil, sql.ErrNoRows
 	}
+	// Workflow state and publication outcome are not directly editable: every
+	// state change must go through the validated workflow transitions.
 	allowed := map[string]bool{
 		"title": true, "category": true, "platform": true,
 		"published_at": true, "duration": true, "views": true, "likes": true,
 		"comments": true, "saves": true, "shares": true, "completion": true,
-		"source": true, "lifecycle": true, "materials": true, "cover_url": true,
+		"source": true, "materials": true, "cover_url": true,
 		"owner": true, "notes": true, "profile_visits": true, "follows": true,
 		"attendance": true, "tickets": true, "comment_text": true,
 		"adopted": true, "recommendation_id": true, "performance_id": true,
-		"owner_user_id": true, "workflow_state": true,
+		"owner_user_id": true,
 	}
 	tx, err := r.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -147,24 +149,12 @@ func (r *Postgres) UpdateContent(
 	}
 	var assignments []string
 	var args []any
-	afterState := beforeState
-	afterLifecycle := beforeLifecycle
 	for key, value := range values {
 		if !allowed[key] {
 			continue
 		}
 		if (key == "recommendation_id" || key == "performance_id" || key == "owner_user_id") && value == "" {
 			value = nil
-		}
-		if key == "workflow_state" {
-			if state, ok := value.(string); ok {
-				afterState = state
-			}
-		}
-		if key == "lifecycle" {
-			if lifecycle, ok := value.(string); ok {
-				afterLifecycle = lifecycle
-			}
 		}
 		if key == "owner_user_id" && value != nil {
 			numeric, ok := value.(float64)
@@ -219,20 +209,8 @@ func (r *Postgres) UpdateContent(
 		args = append(args, value)
 		assignments = append(assignments, fmt.Sprintf("%s = $%d", key, len(args)))
 	}
-	if afterLifecycle != domain.LifecyclePublished && afterLifecycle != domain.LifecycleUnpublished {
-		return nil, errors.New("内容状态只能是已发布或未发布")
-	}
-	if afterLifecycle == domain.LifecyclePublished && afterState != domain.WorkflowPublished {
-		return nil, errors.New("已发布状态必须使用已发布工作流")
-	}
-	if afterLifecycle == domain.LifecycleUnpublished && afterState == domain.WorkflowPublished {
-		return nil, errors.New("已发布工作流必须使用已发布状态")
-	}
-	switch afterState {
-	case domain.WorkflowProductionPending, domain.WorkflowProductionDone, domain.WorkflowSchedulePending, domain.WorkflowScheduled, domain.WorkflowPublished, domain.WorkflowUnpublished:
-	default:
-		return nil, errors.New("工作流状态无效")
-	}
+	// The workflow state and lifecycle cannot change here, so they stay consistent
+	// with the transition rules by construction.
 	if len(assignments) > 0 {
 		args = append(args, contentID, teamID)
 		query := "UPDATE content SET " + strings.Join(assignments, ", ") +
@@ -315,43 +293,37 @@ func (r *Postgres) DeleteContent(
 	return tx.Commit()
 }
 
-// AdvanceWorkflow moves a draft from production pending to production done.
+// ContentWorkflowState returns the persisted workflow state of one record.
+func (r *Postgres) ContentWorkflowState(ctx context.Context, teamID int64, contentID string) (string, error) {
+	var state string
+	err := r.DB.QueryRowContext(ctx, `SELECT workflow_state FROM content WHERE id=$1 AND team_id=$2`, contentID, teamID).Scan(&state)
+	return state, err
+}
+
+// AdvanceWorkflow moves one record to its next workflow state. It uses the same
+// transition rule and field whitelist as the batch endpoint.
 func (r *Postgres) AdvanceWorkflow(
 	ctx context.Context,
 	teamID, actorID int64,
 	actor, contentID string,
+	fields map[string]any,
 ) (map[string]any, error) {
-	tx, err := r.DB.BeginTx(ctx, nil)
+	current, err := r.ContentWorkflowState(ctx, teamID, contentID)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `
-		UPDATE content SET workflow_state = $1, updated_at = NOW()
-		WHERE id = $2 AND team_id = $3 AND workflow_state = $4
-	`, domain.WorkflowProductionDone, contentID, teamID, domain.WorkflowProductionPending)
+	target, ok := domain.NextWorkflowState(current)
+	if !ok {
+		return nil, fmt.Errorf("当前状态为「%s」，没有可推进的下一状态", current)
+	}
+	outcome, err := r.TransitionContents(ctx, teamID, actorID, actor, target, []TransitionItem{{ID: contentID, Fields: fields}})
 	if err != nil {
 		return nil, err
 	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if count != 1 {
-		return nil, errors.New("仅待制作内容可以推进到已制作")
-	}
-	if _, err = tx.ExecContext(ctx, `
-		INSERT INTO content_workflow_event
-		(team_id, content_id, from_state, to_state, source, actor_user_id, created_at)
-		VALUES ($1,$2,$3,$4,'manual',$5,NOW())
-	`, teamID, contentID, domain.WorkflowProductionPending, domain.WorkflowProductionDone, actorID); err != nil {
-		return nil, err
-	}
-	if err = insertAudit(ctx, tx, teamID, actor, "advance_workflow", "content", contentID, "待制作 → 已制作"); err != nil {
-		return nil, err
-	}
-	if err = tx.Commit(); err != nil {
-		return nil, err
+	for _, result := range outcome.Results {
+		if result.Status != "advanced" {
+			return nil, errors.New(result.Reason)
+		}
 	}
 	return r.GetContent(ctx, teamID, contentID)
 }
@@ -369,7 +341,7 @@ func validateContent(content domain.Content) error {
 	switch content.WorkflowState {
 	case domain.WorkflowProductionPending, domain.WorkflowProductionDone,
 		domain.WorkflowSchedulePending, domain.WorkflowScheduled,
-		domain.WorkflowPublished, domain.WorkflowUnpublished:
+		domain.WorkflowPublished:
 	default:
 		return errors.New("工作流状态无效")
 	}

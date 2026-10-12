@@ -16,7 +16,6 @@ const (
 	WorkflowSchedulePending   = "待排期"
 	WorkflowScheduled         = "已排期"
 	WorkflowPublished         = "已发布"
-	WorkflowUnpublished       = "未发布"
 )
 
 // Team is an isolated organization workspace.

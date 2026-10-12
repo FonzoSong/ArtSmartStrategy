@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/arts-smart/strategy/internal/domain"
 )
 
 // RuleResult describes one rule evaluation without persistence side effects.
@@ -57,7 +59,7 @@ func EvaluateRule(ruleType, rawContent, text string, tags []string) (RuleResult,
 	case "tag_constraint":
 		if required, ok := config["required"].([]any); ok {
 			for _, item := range required {
-				if name, ok := item.(string); ok && !contains(tags, name) {
+				if name, ok := item.(string); ok && !domain.ContainsString(tags, name) {
 					matched = true
 				}
 			}
@@ -75,11 +77,3 @@ func EvaluateRule(ruleType, rawContent, text string, tags []string) (RuleResult,
 }
 
 func number(value any) (float64, bool) { number, ok := value.(float64); return number, ok }
-func contains(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
-}

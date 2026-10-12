@@ -11,12 +11,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/arts-smart/strategy/internal/config"
 	"github.com/arts-smart/strategy/internal/domain"
+	"github.com/arts-smart/strategy/internal/report"
 	"github.com/arts-smart/strategy/internal/repository"
 	"github.com/arts-smart/strategy/internal/service"
 	"github.com/google/uuid"
@@ -62,6 +64,7 @@ func New(cfg config.Config, store *repository.Postgres, logger *slog.Logger) htt
 	mux.Handle("PATCH /api/contents/{id}", server.authenticated(server.editors(http.HandlerFunc(server.updateContent))))
 	mux.Handle("DELETE /api/contents/{id}", server.authenticated(server.editors(http.HandlerFunc(server.deleteContent))))
 	mux.Handle("POST /api/contents/{id}/advance", server.authenticated(server.editors(http.HandlerFunc(server.advanceContent))))
+	mux.Handle("POST /api/contents/advance-bulk", server.authenticated(server.editors(http.HandlerFunc(server.advanceBulkContents))))
 	mux.Handle("POST /api/contents/bulk", server.authenticated(server.editors(http.HandlerFunc(server.bulkContents))))
 	mux.Handle("GET /api/teams", server.authenticated(http.HandlerFunc(server.teams)))
 	mux.Handle("GET /api/users", server.authenticated(http.HandlerFunc(server.users)))
@@ -83,6 +86,7 @@ func New(cfg config.Config, store *repository.Postgres, logger *slog.Logger) htt
 	mux.Handle("POST /api/ai/insight", server.authenticated(http.HandlerFunc(server.insight)))
 	mux.Handle("POST /api/settings/sample-threshold", server.authenticated(server.owners(http.HandlerFunc(server.sampleThreshold))))
 	mux.Handle("GET /api/rules", server.authenticated(http.HandlerFunc(server.rules)))
+	mux.Handle("GET /api/rules/system", server.authenticated(http.HandlerFunc(server.systemRules)))
 	mux.Handle("POST /api/rules", server.authenticated(server.editors(http.HandlerFunc(server.createRule))))
 	mux.Handle("POST /api/rules/preview", server.authenticated(server.editors(http.HandlerFunc(server.previewRule))))
 	mux.Handle("POST /api/rules/evaluate", server.authenticated(server.editors(http.HandlerFunc(server.evaluateRules))))
@@ -91,6 +95,7 @@ func New(cfg config.Config, store *repository.Postgres, logger *slog.Logger) htt
 	mux.Handle("DELETE /api/rules/{id}", server.authenticated(server.editors(http.HandlerFunc(server.deleteRule))))
 	mux.Handle("PATCH /api/teams/{id}", server.authenticated(server.owners(http.HandlerFunc(server.renameTeam))))
 	mux.Handle("GET /api/stats/overview", server.authenticated(http.HandlerFunc(server.overview)))
+	mux.Handle("GET /api/stats/dashboard", server.authenticated(http.HandlerFunc(server.dashboardStats)))
 	mux.Handle("GET /api/stats/platform", server.authenticated(http.HandlerFunc(server.platformStats)))
 	mux.Handle("GET /api/stats/trend", server.authenticated(http.HandlerFunc(server.trendStats)))
 	mux.Handle("GET /api/stats/category", server.authenticated(http.HandlerFunc(server.categoryStats)))
@@ -113,6 +118,7 @@ func New(cfg config.Config, store *repository.Postgres, logger *slog.Logger) htt
 	mux.Handle("GET /api/report/export", server.authenticated(http.HandlerFunc(server.exportReport)))
 	mux.Handle("GET /api/schedule", server.authenticated(http.HandlerFunc(server.schedule)))
 	mux.Handle("POST /api/schedule/manual", server.authenticated(server.editors(http.HandlerFunc(server.manualSchedule))))
+	mux.Handle("POST /api/schedule/manual-batch", server.authenticated(server.editors(http.HandlerFunc(server.manualScheduleBatch))))
 	mux.Handle("GET /api/schedule/policy", server.authenticated(http.HandlerFunc(server.schedulePolicy)))
 	mux.Handle("POST /api/schedule/adopt", server.authenticated(server.editors(http.HandlerFunc(server.adoptSchedules))))
 	mux.Handle("PATCH /api/schedule/{id}", server.authenticated(server.editors(http.HandlerFunc(server.updateSchedule))))
@@ -317,10 +323,19 @@ func (s *Server) contentWorkflowEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createContent(w http.ResponseWriter, r *http.Request) {
-	var input domain.Content
-	if !decode(w, r, &input) {
+	var payload struct {
+		domain.Content
+		PublishedAt flexibleTime `json:"published_at"`
+	}
+	if !decode(w, r, &payload) {
 		return
 	}
+	input := payload.Content
+	input.PublishedAt = payload.PublishedAt.Time
+	// New records always start at the beginning of the workflow; the client
+	// cannot pick an initial state.
+	input.WorkflowState = domain.WorkflowProductionPending
+	input.Lifecycle = domain.LifecycleUnpublished
 	c := claimsFrom(r)
 	if message := s.contentRuleFailure(r, c.TeamID, input.Title+"\n"+input.Notes, input.Tags, input.Category, input.WorkflowState); message != "" {
 		writeError(w, r, 422, "content_rule_failed", message)
@@ -375,13 +390,66 @@ func (s *Server) deleteContent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) advanceContent(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Fields map[string]any `json:"fields"`
+	}
+	if r.ContentLength > 0 && !decode(w, r, &input) {
+		return
+	}
 	c := claimsFrom(r)
-	item, err := s.Store.AdvanceWorkflow(r.Context(), c.TeamID, c.UserID, c.Name, r.PathValue("id"))
+	item, err := s.Store.AdvanceWorkflow(r.Context(), c.TeamID, c.UserID, c.Name, r.PathValue("id"), input.Fields)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, r, 404, "content_not_found", "内容记录不存在")
+			return
+		}
 		writeError(w, r, http.StatusConflict, "workflow_conflict", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
+}
+
+// advanceBulkContents moves the selected records one workflow step using the
+// same transition rule as the single-record endpoint. Each record reports its own
+// result so partial failures stay visible instead of becoming a silent success.
+func (s *Server) advanceBulkContents(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Target string `json:"target"`
+		Items  []struct {
+			ID     string         `json:"id"`
+			Fields map[string]any `json:"fields"`
+		} `json:"items"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if len(input.Items) == 0 {
+		writeError(w, r, 422, "bulk_empty", "请先选择内容记录")
+		return
+	}
+	if len(input.Items) > 200 {
+		writeError(w, r, 422, "bulk_too_large", "单次批量推进最多 200 条记录")
+		return
+	}
+	if !domain.IsWorkflowState(input.Target) {
+		writeError(w, r, 422, "workflow_target_invalid", "目标工作流状态无效")
+		return
+	}
+	items := make([]repository.TransitionItem, 0, len(input.Items))
+	for _, item := range input.Items {
+		if !regexpUUID(item.ID) {
+			writeError(w, r, 422, "content_id_invalid", "内容 ID 无效")
+			return
+		}
+		items = append(items, repository.TransitionItem{ID: item.ID, Fields: item.Fields})
+	}
+	c := claimsFrom(r)
+	outcome, err := s.Store.TransitionContents(r.Context(), c.TeamID, c.UserID, c.Name, input.Target, items)
+	if err != nil {
+		writeError(w, r, 500, "workflow_advance_failed", "批量推进工作流失败")
+		return
+	}
+	writeJSON(w, 200, outcome)
 }
 
 func (s *Server) bulkContents(w http.ResponseWriter, r *http.Request) {
@@ -404,6 +472,12 @@ func (s *Server) bulkContents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	c := claimsFrom(r)
+	// Workflow state changes are not accepted here: they must go through the
+	// validated transitions in /api/contents/advance-bulk and /api/schedule.
+	if input.Action != "delete" {
+		writeError(w, r, 422, "bulk_action_invalid", "不支持的批量操作：状态变更请使用工作流或排期接口")
+		return
+	}
 	tx, err := s.Store.DB.BeginTx(r.Context(), nil)
 	if err != nil {
 		writeError(w, r, 500, "bulk_failed", "批量操作失败")
@@ -417,49 +491,14 @@ func (s *Server) bulkContents(w http.ResponseWriter, r *http.Request) {
 		args = append(args, id)
 		placeholders[i] = "$" + strconv.Itoa(i+2)
 	}
-	switch input.Action {
-	case "delete":
-		result, execErr := tx.ExecContext(r.Context(), `DELETE FROM content WHERE team_id=$1 AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
-		if execErr != nil {
-			writeError(w, r, 500, "bulk_delete_failed", "批量删除失败")
-			return
-		}
-		count, _ := result.RowsAffected()
-		if _, err = tx.ExecContext(r.Context(), `INSERT INTO audit_log(team_id,actor,action,entity_type,entity_id,detail,created_at) VALUES($1,$2,'bulk_delete','content','bulk',$3,NOW())`, c.TeamID, c.Name, fmt.Sprintf("批量删除 %d 条内容", count)); err != nil {
-			writeError(w, r, 500, "bulk_audit_failed", "记录批量操作失败")
-			return
-		}
-	case "set_status":
-		state := input.Status
-		lifecycle := domain.LifecycleUnpublished
-		if state == domain.WorkflowPublished || state == domain.LifecyclePublished {
-			state = domain.WorkflowPublished
-			lifecycle = domain.LifecyclePublished
-		} else if state == domain.LifecycleUnpublished {
-			state = domain.WorkflowUnpublished
-		}
-		if state != domain.WorkflowPublished && state != domain.WorkflowUnpublished {
-			writeError(w, r, 422, "status_invalid", "批量状态只能设置为已发布或未发布")
-			return
-		}
-		for _, id := range input.IDs {
-			var before string
-			if err = tx.QueryRowContext(r.Context(), `SELECT workflow_state FROM content WHERE id=$1 AND team_id=$2 FOR UPDATE`, id, c.TeamID).Scan(&before); err != nil {
-				continue
-			}
-			if _, err = tx.ExecContext(r.Context(), `UPDATE content SET lifecycle=$1,workflow_state=$2,updated_at=NOW() WHERE id=$3 AND team_id=$4`, lifecycle, state, id, c.TeamID); err != nil {
-				writeError(w, r, 500, "bulk_update_failed", "批量更新状态失败")
-				return
-			}
-			if before != state {
-				if _, err = tx.ExecContext(r.Context(), `INSERT INTO content_workflow_event(team_id,content_id,from_state,to_state,source,actor_user_id,created_at) VALUES($1,$2,$3,$4,'manual',$5,NOW())`, c.TeamID, id, before, state, c.UserID); err != nil {
-					writeError(w, r, 500, "bulk_event_failed", "记录工作流变更失败")
-					return
-				}
-			}
-		}
-	default:
-		writeError(w, r, 422, "bulk_action_invalid", "不支持的批量操作")
+	result, execErr := tx.ExecContext(r.Context(), `DELETE FROM content WHERE team_id=$1 AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if execErr != nil {
+		writeError(w, r, 500, "bulk_delete_failed", "批量删除失败")
+		return
+	}
+	count, _ := result.RowsAffected()
+	if _, err = tx.ExecContext(r.Context(), `INSERT INTO audit_log(team_id,actor,action,entity_type,entity_id,detail,created_at) VALUES($1,$2,'bulk_delete','content','bulk',$3,NOW())`, c.TeamID, c.Name, fmt.Sprintf("批量删除 %d 条内容", count)); err != nil {
+		writeError(w, r, 500, "bulk_audit_failed", "记录批量操作失败")
 		return
 	}
 	if err = tx.Commit(); err != nil {
@@ -599,12 +638,48 @@ func (s *Server) renameTeam(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) rules(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.Store.ListTeamRows(r.Context(), `SELECT cr.*,u.name AS updated_by FROM content_rule cr LEFT JOIN user_account u ON u.id=cr.updated_by_user_id WHERE cr.team_id=$1 ORDER BY cr.priority,cr.id`, claimsFrom(r).TeamID)
+	rows, err := s.Store.ListTeamRows(r.Context(), `SELECT cr.*,u.name AS updated_by,l.result AS last_result,l.detail AS last_detail,l.created_at AS last_executed_at FROM content_rule cr LEFT JOIN user_account u ON u.id=cr.updated_by_user_id LEFT JOIN LATERAL (SELECT result,detail,created_at FROM rule_execution_log rel WHERE rel.rule_id=cr.id AND rel.team_id=cr.team_id ORDER BY rel.created_at DESC LIMIT 1) l ON TRUE WHERE cr.team_id=$1 ORDER BY cr.priority,cr.id`, claimsFrom(r).TeamID)
 	if err != nil {
 		writeError(w, r, 500, "rules_failed", "读取内容规则失败")
 		return
 	}
 	writeJSON(w, 200, rows)
+}
+
+// systemRuleSet is a read-only, versioned rule set shipped with the service.
+type systemRuleSet struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	Enabled     bool   `json:"enabled"`
+	UpdatedAt   string `json:"updated_at"`
+	Description string `json:"description"`
+	RuleCount   int64  `json:"rule_count"`
+	Effective   bool   `json:"effective"`
+}
+
+// systemRules exposes the read-only rule set for display. It is never editable
+// through the API and does not replace team-authored content rules.
+func (s *Server) systemRules(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.Store.QueryMaps(r.Context(), `SELECT s.id,s.name,s.version,s.enabled,s.updated_at,COALESCE(s.payload_json->>'description','') AS description,jsonb_array_length(COALESCE(s.payload_json->'rules','[]'::jsonb)) AS rule_count,(s.id=(SELECT e.id FROM system_rule_set e WHERE e.enabled=TRUE ORDER BY e.updated_at DESC LIMIT 1)) AS effective FROM system_rule_set s ORDER BY s.name,s.version`)
+	if err != nil {
+		writeError(w, r, 500, "system_rules_failed", "读取系统规则集失败")
+		return
+	}
+	items := make([]systemRuleSet, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, systemRuleSet{
+			ID:          intField(row, "id"),
+			Name:        stringField(row, "name"),
+			Version:     stringField(row, "version"),
+			Enabled:     boolField(row, "enabled"),
+			UpdatedAt:   timestampField(row, "updated_at"),
+			Description: stringField(row, "description"),
+			RuleCount:   intField(row, "rule_count"),
+			Effective:   boolField(row, "effective"),
+		})
+	}
+	writeJSON(w, 200, map[string]any{"items": items})
 }
 
 type ruleInput struct {
@@ -1237,20 +1312,114 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	s.settings(w, r)
 }
 
+// overviewTopContent is one entry of the published-content ranking. The score is
+// computed from the team's configured weights so it matches the analysis page.
+type overviewTopContent struct {
+	ID              string  `json:"id"`
+	Title           string  `json:"title"`
+	Category        string  `json:"category"`
+	Platform        string  `json:"platform"`
+	Completion      float64 `json:"completion"`
+	InteractionRate float64 `json:"interaction_rate"`
+	Score           float64 `json:"score"`
+	PublishedAt     string  `json:"published_at"`
+}
+
+// overviewResponse is the statistics contract consumed by the operations
+// overview. Every field is always present, so the page never renders undefined.
+type overviewResponse struct {
+	PublishedCount    int64                `json:"published_count"`
+	UnpublishedCount  int64                `json:"unpublished_count"`
+	TotalPosts        int64                `json:"total_posts"`
+	TotalViews        int64                `json:"total_views"`
+	TotalLikes        int64                `json:"total_likes"`
+	TotalInteractions int64                `json:"total_interactions"`
+	PlatformCount     int64                `json:"platform_count"`
+	AvgCompletion     float64              `json:"avg_completion"`
+	SampleCount       int64                `json:"sample_count"`
+	TopContents       []overviewTopContent `json:"top_contents"`
+	Weights           map[string]float64   `json:"weights"`
+}
+
+// buildOverviewResponse normalizes one aggregate row into the response contract.
+// Missing or null columns become zero values and an empty ranking, never nil.
+func buildOverviewResponse(row map[string]any, top []overviewTopContent, weights map[string]float64) overviewResponse {
+	published := intField(row, "published_count")
+	result := overviewResponse{
+		PublishedCount:    published,
+		UnpublishedCount:  intField(row, "unpublished_count"),
+		TotalPosts:        published,
+		TotalViews:        intField(row, "total_views"),
+		TotalLikes:        intField(row, "total_likes"),
+		TotalInteractions: intField(row, "total_interactions"),
+		PlatformCount:     intField(row, "platform_count"),
+		AvgCompletion:     floatField(row, "avg_completion"),
+		SampleCount:       intField(row, "sample_count"),
+		TopContents:       top,
+		Weights:           weights,
+	}
+	if result.TopContents == nil {
+		result.TopContents = []overviewTopContent{}
+	}
+	return result
+}
+
+// overview returns the published-content aggregates plus a ranked list of the
+// best performing published assets.
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	c := claimsFrom(r)
-	var result map[string]any
-	rows, err := s.Store.QueryMaps(r.Context(), `SELECT COUNT(*) FILTER (WHERE lifecycle='已发布') AS published_count, COUNT(*) FILTER (WHERE lifecycle='未发布') AS unpublished_count, COALESCE(SUM(views) FILTER (WHERE lifecycle='已发布'),0) AS total_views, COALESCE(SUM(likes) FILTER (WHERE lifecycle='已发布'),0) AS total_likes, COALESCE(AVG(completion) FILTER (WHERE lifecycle='已发布'),0) AS avg_completion, COUNT(*) FILTER (WHERE lifecycle='已发布') AS sample_count FROM content WHERE team_id=$1`, c.TeamID)
+	rows, err := s.Store.QueryMaps(r.Context(), `SELECT COUNT(*) FILTER (WHERE lifecycle='已发布') AS published_count, COUNT(*) FILTER (WHERE lifecycle='未发布') AS unpublished_count, COALESCE(SUM(views) FILTER (WHERE lifecycle='已发布'),0) AS total_views, COALESCE(SUM(likes) FILTER (WHERE lifecycle='已发布'),0) AS total_likes, COALESCE(SUM(total_interactions) FILTER (WHERE lifecycle='已发布'),0) AS total_interactions, COUNT(DISTINCT platform) FILTER (WHERE lifecycle='已发布') AS platform_count, COALESCE(AVG(completion) FILTER (WHERE lifecycle='已发布'),0) AS avg_completion, COUNT(*) FILTER (WHERE lifecycle='已发布') AS sample_count FROM content WHERE team_id=$1`, c.TeamID)
 	if err != nil {
 		writeError(w, r, 500, "stats_failed", "统计内容表现失败")
 		return
 	}
+	var row map[string]any
 	if len(rows) > 0 {
-		result = rows[0]
-	} else {
-		result = map[string]any{}
+		row = rows[0]
 	}
-	writeJSON(w, http.StatusOK, result)
+	completionWeight, interactionWeight := .6, .4
+	_ = s.Store.DB.QueryRowContext(r.Context(), `SELECT score_completion_weight,score_interaction_weight FROM ai_config WHERE team_id=$1 ORDER BY updated_at DESC LIMIT 1`, c.TeamID).Scan(&completionWeight, &interactionWeight)
+	weights := map[string]float64{"completion": completionWeight, "interaction": interactionWeight}
+	top, err := s.Store.QueryMaps(r.Context(), `SELECT id,title,category,platform,published_at,views,total_interactions,completion FROM content WHERE team_id=$1 AND lifecycle='已发布' AND workflow_state='已发布' ORDER BY (completion*$2 + (CASE WHEN views=0 THEN 0 ELSE 100.0*total_interactions/views END)*$3) DESC, published_at DESC, id LIMIT 8`, c.TeamID, completionWeight, interactionWeight)
+	if err != nil {
+		writeError(w, r, 500, "stats_failed", "统计优质内容失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, buildOverviewResponse(row, rankTopContents(top, weights), weights))
+}
+
+// rankTopContents computes the composite score in Go so the numeric type of the
+// value is explicit, then applies a deterministic ordering.
+func rankTopContents(rows []map[string]any, weights map[string]float64) []overviewTopContent {
+	items := make([]overviewTopContent, 0, len(rows))
+	for _, row := range rows {
+		views := intField(row, "views")
+		completion := floatField(row, "completion")
+		interactionRate := 0.0
+		if views > 0 {
+			interactionRate = 100 * float64(intField(row, "total_interactions")) / float64(views)
+		}
+		items = append(items, overviewTopContent{
+			ID:              stringField(row, "id"),
+			Title:           stringField(row, "title"),
+			Category:        stringField(row, "category"),
+			Platform:        stringField(row, "platform"),
+			Completion:      roundTo(completion, 2),
+			InteractionRate: roundTo(interactionRate, 2),
+			Score:           roundTo(completion*weights["completion"]+interactionRate*weights["interaction"], 2),
+			PublishedAt:     timestampField(row, "published_at"),
+		})
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Score != items[j].Score {
+			return items[i].Score > items[j].Score
+		}
+		if items[i].PublishedAt != items[j].PublishedAt {
+			return items[i].PublishedAt > items[j].PublishedAt
+		}
+		return items[i].ID < items[j].ID
+	})
+	return items
 }
 
 func (s *Server) platformStats(w http.ResponseWriter, r *http.Request) {
@@ -1272,19 +1441,70 @@ func (s *Server) trendStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": rows})
 }
 
-func (s *Server) schedulePolicy(w http.ResponseWriter, r *http.Request) {
+// Rule-set availability errors are answered with 503; everything else means the
+// submitted plan itself was rejected.
+var (
+	errRuleSetUnavailable = errors.New("数据库中没有可用的只读排期规则集")
+	errRuleSetInvalid     = errors.New("排期规则集格式无效")
+)
+
+// loadPlanningRules reads the effective read-only rule set and derives the
+// inclusive planning window every scheduling path shares.
+func (s *Server) loadPlanningRules(ctx context.Context) (service.SlotPolicy, domain.PlanningWindow, error) {
+	var policy service.SlotPolicy
 	var raw []byte
-	err := s.Store.DB.QueryRowContext(r.Context(), `SELECT payload_json->'schedule_policy' FROM system_rule_set WHERE enabled=TRUE ORDER BY updated_at DESC LIMIT 1`).Scan(&raw)
+	if err := s.Store.DB.QueryRowContext(ctx, `SELECT payload_json->'schedule_policy' FROM system_rule_set WHERE enabled=TRUE ORDER BY updated_at DESC LIMIT 1`).Scan(&raw); err != nil {
+		return policy, domain.PlanningWindow{}, errRuleSetUnavailable
+	}
+	if err := json.Unmarshal(raw, &policy); err != nil {
+		return policy, domain.PlanningWindow{}, errRuleSetInvalid
+	}
+	window, ok := policy.Window(time.Now())
+	if !ok || len(policy.TimeWindows) == 0 {
+		return policy, domain.PlanningWindow{}, errRuleSetInvalid
+	}
+	return policy, window, nil
+}
+
+// schedulePolicyResponse is the typed contract the web client uses to render
+// the planning window and to pre-check edited suggestions.
+type schedulePolicyResponse struct {
+	HorizonDays           int      `json:"planning_horizon_days"`
+	HorizonDefinition     string   `json:"horizon_definition"`
+	TimeWindows           []string `json:"time_windows"`
+	Weekdays              []string `json:"weekdays"`
+	MaxPerDay             int      `json:"max_per_day"`
+	MaxPerPlatformPerWeek int      `json:"max_per_platform_per_week"`
+	WindowStart           string   `json:"window_start"`
+	WindowEnd             string   `json:"window_end"`
+}
+
+func (s *Server) schedulePolicy(w http.ResponseWriter, r *http.Request) {
+	policy, window, err := s.loadPlanningRules(r.Context())
 	if err != nil {
-		writeError(w, r, 503, "schedule_rules_unavailable", "数据库中没有可用的只读排期规则集")
+		writeRuleSetError(w, r, err)
 		return
 	}
-	var policy map[string]any
-	if err = json.Unmarshal(raw, &policy); err != nil {
-		writeError(w, r, 503, "schedule_rules_invalid", "排期规则集格式无效")
+	writeJSON(w, 200, schedulePolicyResponse{
+		HorizonDays:           policy.HorizonDays,
+		HorizonDefinition:     "planning_horizon_days 为从今天起（含今天）共 N 个自然日",
+		TimeWindows:           policy.TimeWindows,
+		Weekdays:              policy.Weekdays,
+		MaxPerDay:             policy.MaxPerDay,
+		MaxPerPlatformPerWeek: policy.MaxPerPlatformPerWeek,
+		WindowStart:           window.Start.Format("2006-01-02"),
+		WindowEnd:             window.End.Format("2006-01-02"),
+	})
+}
+
+// writeRuleSetError answers rule-set availability problems with 503 and plan
+// rejections with 422, so the web client can tell them apart.
+func writeRuleSetError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, errRuleSetUnavailable) || errors.Is(err, errRuleSetInvalid) {
+		writeError(w, r, http.StatusServiceUnavailable, "schedule_rules_unavailable", err.Error())
 		return
 	}
-	writeJSON(w, 200, policy)
+	writeError(w, r, http.StatusUnprocessableEntity, "schedule_policy_rejected", err.Error())
 }
 
 func (s *Server) adoptionGains(w http.ResponseWriter, r *http.Request) {
@@ -1356,12 +1576,47 @@ func (s *Server) funnelStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) diagnostics(w http.ResponseWriter, r *http.Request) {
-	items, err := s.Store.ListTeamRows(r.Context(), `SELECT lifecycle,COUNT(*) AS count FROM content WHERE team_id=$1 GROUP BY lifecycle ORDER BY lifecycle`, claimsFrom(r).TeamID)
+	rows, err := s.Store.QueryMaps(r.Context(), `SELECT lifecycle,COUNT(*) AS count FROM content WHERE team_id=$1 GROUP BY lifecycle`, claimsFrom(r).TeamID)
 	if err != nil {
 		writeError(w, r, 500, "diagnostics_failed", "读取运营提醒失败")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"items": items})
+	writeJSON(w, 200, map[string]any{"items": buildDiagnostics(rows)})
+}
+
+// diagnosticItem is one plain-language operations reminder.
+type diagnosticItem struct {
+	Level   string `json:"level"`
+	Message string `json:"message"`
+}
+
+// buildDiagnostics turns lifecycle aggregates into reminders. The level drives
+// the icon on the overview page, so it always uses a known value.
+func buildDiagnostics(rows []map[string]any) []diagnosticItem {
+	var published, unpublished int64
+	for _, row := range rows {
+		switch stringField(row, "lifecycle") {
+		case domain.LifecyclePublished:
+			published = intField(row, "count")
+		case domain.LifecycleUnpublished:
+			unpublished = intField(row, "count")
+		}
+	}
+	items := make([]diagnosticItem, 0, 3)
+	switch {
+	case published == 0 && unpublished == 0:
+		items = append(items, diagnosticItem{Level: "info", Message: "当前团队还没有内容记录，先录入一条内容资产再开始复盘。"})
+	default:
+		if published == 0 {
+			items = append(items, diagnosticItem{Level: "info", Message: "还没有已发布内容，录入实际发布数据后才会生成效果分析。"})
+		} else {
+			items = append(items, diagnosticItem{Level: "good", Message: fmt.Sprintf("已有 %d 条已发布内容纳入复盘，样本越多结论越可靠。", published)})
+		}
+		if unpublished > 0 {
+			items = append(items, diagnosticItem{Level: "warn", Message: fmt.Sprintf("还有 %d 条未发布内容尚未排期，建议生成排期建议并确认负责人。", unpublished)})
+		}
+	}
+	return items
 }
 
 func (s *Server) sampleThreshold(w http.ResponseWriter, r *http.Request) {
@@ -1486,16 +1741,70 @@ func (s *Server) exportHandover(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"team_name": team, "summary": stats, "upcoming_schedules": schedules})
 }
 
+// exportReport renders the operations report as a real PDF document. It uses the
+// same filtered statistics as the dashboard, so the exported numbers always match
+// the page the user is looking at.
 func (s *Server) exportReport(w http.ResponseWriter, r *http.Request) {
 	teamID := claimsFrom(r).TeamID
-	team, _ := s.Store.TeamName(r.Context(), teamID)
-	rows, err := s.Store.ListTeamRows(r.Context(), `SELECT category,platform,COUNT(*) AS sample_count,AVG(views) AS avg_views,AVG(completion) AS avg_completion FROM content WHERE team_id=$1 AND lifecycle='已发布' AND workflow_state='已发布' GROUP BY category,platform ORDER BY category,platform`, teamID)
+	filter, err := parseStatsFilter(r)
+	if err != nil {
+		writeError(w, r, 422, "stats_filter_invalid", err.Error())
+		return
+	}
+	response, err := s.buildDashboard(r.Context(), teamID, filter)
 	if err != nil {
 		writeError(w, r, 500, "report_failed", "生成运营报告失败")
 		return
 	}
-	w.Header().Set("Content-Disposition", "attachment; filename=export.json")
-	writeJSON(w, 200, map[string]any{"team_name": team, "generated_at": time.Now().UTC(), "published_performance": rows})
+	team, _ := s.Store.TeamName(r.Context(), teamID)
+	document := report.Document{
+		TeamName:    team,
+		GeneratedAt: response.GeneratedAt,
+		Range:       response.RangeLabel,
+		Filters:     response.Filters,
+		Summary: [][2]string{
+			{"已发布内容（条）", fmt.Sprintf("%d", response.Current.PublishedCount)},
+			{"总播放量", fmt.Sprintf("%d", response.Current.TotalViews)},
+			{"总点赞量", fmt.Sprintf("%d", response.Current.TotalLikes)},
+			{"总评论量", fmt.Sprintf("%d", response.Current.TotalComments)},
+			{"总收藏量", fmt.Sprintf("%d", response.Current.TotalSaves)},
+			{"总互动量", fmt.Sprintf("%d（互动率 %.2f%%）", response.Current.TotalInteractions, response.Current.InteractionRate)},
+			{"平均看完比例", fmt.Sprintf("%.2f%%", response.Current.AvgCompletion)},
+		},
+		Footer: "指标口径：仅统计 lifecycle = 已发布 且发布时间落在所选范围内的内容；互动量 = 点赞 + 评论 + 收藏 + 转发。",
+	}
+	platformTable := report.Table{Title: "平台表现", Headers: []string{"平台", "发布数", "播放量", "互动量", "互动率", "平均看完"}}
+	for _, row := range response.Platforms {
+		platformTable.Rows = append(platformTable.Rows, []string{row.Name, fmt.Sprintf("%d", row.PublishedCount), fmt.Sprintf("%d", row.TotalViews), fmt.Sprintf("%d", row.TotalInteractions), fmt.Sprintf("%.2f%%", row.InteractionRate), fmt.Sprintf("%.2f%%", row.AvgCompletion)})
+	}
+	document.Tables = append(document.Tables, platformTable)
+	categoryTable := report.Table{Title: "内容类型表现", Headers: []string{"内容类型", "发布数", "播放量", "互动量"}}
+	for _, row := range response.Categories {
+		categoryTable.Rows = append(categoryTable.Rows, []string{row.Name, fmt.Sprintf("%d", row.PublishedCount), fmt.Sprintf("%d", row.TotalViews), fmt.Sprintf("%d", row.TotalInteractions)})
+	}
+	document.Tables = append(document.Tables, categoryTable)
+	workflowTable := report.Table{Title: "工作流分布", Headers: []string{"内容分类", "数量"}, Note: "未发布与已发布为发布结果视图，其余为工作流状态。"}
+	for _, row := range response.Workflow {
+		workflowTable.Rows = append(workflowTable.Rows, []string{row.State, fmt.Sprintf("%d", row.Count)})
+	}
+	document.Tables = append(document.Tables, workflowTable)
+	trendTable := report.Table{Title: "发布趋势", Headers: []string{"时间", "发布数", "播放量", "互动量", "平均看完"}}
+	for _, point := range response.Trend {
+		trendTable.Rows = append(trendTable.Rows, []string{point.Bucket, fmt.Sprintf("%d", point.PublishedCount), fmt.Sprintf("%d", point.TotalViews), fmt.Sprintf("%d", point.TotalInteractions), fmt.Sprintf("%.2f%%", point.AvgCompletion)})
+	}
+	document.Tables = append(document.Tables, trendTable)
+
+	content, err := report.Render(document)
+	if err != nil {
+		writeError(w, r, 500, "report_render_failed", "生成 PDF 文件失败")
+		return
+	}
+	filename := "arts-smart-report-" + time.Now().Format("20060102") + ".pdf"
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
+	w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(content)
 }
 
 func (s *Server) insight(w http.ResponseWriter, r *http.Request) {
@@ -1632,40 +1941,33 @@ func (s *Server) schedule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) manualSchedule(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		ContentID   string `json:"content_id"`
+		Platform    string `json:"platform"`
 		PlannedDate string `json:"planned_date"`
 		PlannedTime string `json:"planned_time"`
+		Owner       string `json:"owner"`
+		Reason      string `json:"reason"`
 	}
 	if !decode(w, r, &input) {
 		return
 	}
-	date := input.PlannedDate
-	if len(date) >= 10 {
-		date = date[:10]
-	}
-	date, err := repository.ParseScheduleDate(date)
-	if err != nil {
-		writeError(w, r, 422, "invalid_date", err.Error())
-		return
-	}
-	if _, err = time.Parse("15:04", input.PlannedTime); err != nil {
-		writeError(w, r, 422, "invalid_time", "发布时间格式必须为 HH:MM")
-		return
-	}
 	c := claimsFrom(r)
-	var platform string
-	if err = s.Store.DB.QueryRowContext(r.Context(), `SELECT platform FROM content WHERE id=$1 AND team_id=$2`, input.ContentID, c.TeamID).Scan(&platform); err != nil {
-		writeError(w, r, 404, "content_not_found", "排期目标内容不存在")
-		return
-	}
-	if err = s.validateSlot(r.Context(), c.TeamID, date, input.PlannedTime, platform); err != nil {
-		writeError(w, r, 422, "schedule_policy_rejected", err.Error())
-		return
-	}
-	item, err := s.Store.CreateManualSchedule(r.Context(), c.TeamID, c.UserID, c.Name, input.ContentID, date, input.PlannedTime)
+	request, err := s.buildScheduleRequest(r, c.TeamID, input.ContentID, input.Platform, input.PlannedDate, input.PlannedTime, input.Owner, input.Reason)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		writeRuleSetError(w, r, err)
+		return
+	}
+	if err = s.validateSlot(r.Context(), c.TeamID, request.PlannedDate, request.PlannedTime, request.Platform, ""); err != nil {
+		writeRuleSetError(w, r, err)
+		return
+	}
+	item, err := s.Store.CreateManualSchedule(r.Context(), c.TeamID, c.UserID, c.Name, request)
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
 			writeError(w, r, 404, "content_not_found", "内容记录不存在")
-		} else {
+		case errors.Is(err, repository.ErrContentNotPlannable), errors.Is(err, repository.ErrContentPublished):
+			writeError(w, r, 422, "content_not_plannable", err.Error())
+		default:
 			writeError(w, r, 409, "schedule_conflict", err.Error())
 		}
 		return
@@ -1673,74 +1975,115 @@ func (s *Server) manualSchedule(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, item)
 }
 
-func (s *Server) validateSlot(ctx context.Context, teamID int64, date, clock, platform string) error {
-	var raw []byte
-	if err := s.Store.DB.QueryRowContext(ctx, `SELECT payload_json->'schedule_policy' FROM system_rule_set WHERE enabled=TRUE ORDER BY updated_at DESC LIMIT 1`).Scan(&raw); err != nil {
-		return errors.New("数据库中没有可用的只读排期规则集")
+// manualScheduleBatch plans several 待排期 records at once. Each record carries
+// its own platform, date and time, and the outcome is reported per record.
+func (s *Server) manualScheduleBatch(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Items []struct {
+			ContentID   string `json:"content_id"`
+			Platform    string `json:"platform"`
+			PlannedDate string `json:"planned_date"`
+			PlannedTime string `json:"planned_time"`
+			Owner       string `json:"owner"`
+			Reason      string `json:"reason"`
+		} `json:"items"`
 	}
-	var policy map[string]any
-	if err := json.Unmarshal(raw, &policy); err != nil {
-		return errors.New("排期规则集格式无效")
+	if !decode(w, r, &input) {
+		return
+	}
+	if len(input.Items) == 0 {
+		writeError(w, r, 422, "bulk_empty", "请先选择待排期内容")
+		return
+	}
+	if len(input.Items) > 100 {
+		writeError(w, r, 422, "bulk_too_large", "单次批量排期最多 100 条记录")
+		return
+	}
+	c := claimsFrom(r)
+	rules, window, err := loadPlanningRulesFrom(r.Context(), s)
+	if err != nil {
+		writeRuleSetError(w, r, err)
+		return
+	}
+	requests := make([]repository.ScheduleRequest, 0, len(input.Items))
+	for _, item := range input.Items {
+		if !regexpUUID(item.ContentID) {
+			writeError(w, r, 422, "content_id_invalid", "内容 ID 无效")
+			return
+		}
+		if _, err = time.Parse("15:04", item.PlannedTime); err != nil {
+			writeError(w, r, 422, "invalid_time", "发布时间格式必须为 HH:MM")
+			return
+		}
+		date, parseErr := repository.ParsePlannedDate(item.PlannedDate)
+		if parseErr != nil {
+			writeError(w, r, 422, "invalid_date", parseErr.Error())
+			return
+		}
+		if strings.TrimSpace(item.Platform) == "" {
+			writeError(w, r, 422, "platform_required", "每条记录都需要选择发布平台")
+			return
+		}
+		requests = append(requests, repository.ScheduleRequest{ContentID: item.ContentID, Platform: strings.TrimSpace(item.Platform), PlannedDate: date, PlannedTime: item.PlannedTime, Owner: item.Owner, Reason: item.Reason})
+	}
+	outcome, err := s.Store.ScheduleContents(r.Context(), c.TeamID, c.UserID, c.Name, requests, rules, window)
+	if err != nil {
+		writeError(w, r, 500, "schedule_batch_failed", "批量排期失败")
+		return
+	}
+	writeJSON(w, 200, outcome)
+}
+
+// buildScheduleRequest normalizes and validates one manual plan.
+func (s *Server) buildScheduleRequest(r *http.Request, teamID int64, contentID, platform, plannedDate, plannedTime, owner, reason string) (repository.ScheduleRequest, error) {
+	date, err := repository.ParsePlannedDate(plannedDate)
+	if err != nil {
+		return repository.ScheduleRequest{}, err
+	}
+	if _, err = time.Parse("15:04", plannedTime); err != nil {
+		return repository.ScheduleRequest{}, errors.New("发布时间格式必须为 HH:MM")
+	}
+	if strings.TrimSpace(platform) == "" {
+		if err = s.Store.DB.QueryRowContext(r.Context(), `SELECT platform FROM content WHERE id=$1 AND team_id=$2`, contentID, teamID).Scan(&platform); err != nil {
+			return repository.ScheduleRequest{}, sql.ErrNoRows
+		}
+	}
+	return repository.ScheduleRequest{ContentID: contentID, Platform: strings.TrimSpace(platform), PlannedDate: date, PlannedTime: plannedTime, Owner: owner, Reason: reason}, nil
+}
+
+// loadPlanningRulesFrom is the package-level form of the server policy loader so
+// handlers can share it without repeating the query.
+func loadPlanningRulesFrom(ctx context.Context, s *Server) (domain.PlanningRules, domain.PlanningWindow, error) {
+	policy, window, err := s.loadPlanningRules(ctx)
+	if err != nil {
+		return domain.PlanningRules{}, domain.PlanningWindow{}, err
+	}
+	return policy.Rules(), window, nil
+}
+
+// validateSlot applies the shared planning rules to a candidate plan, using the
+// same window, weekday, time-window and frequency checks as recommendation
+// adoption. excludeScheduleID keeps an already-planned row from counting itself
+// when an existing plan is edited.
+func (s *Server) validateSlot(ctx context.Context, teamID int64, date, clock, platform, excludeScheduleID string) error {
+	rules, window, err := s.loadPlanningRules(ctx)
+	if err != nil {
+		return err
 	}
 	planned, err := time.Parse("2006-01-02", date)
 	if err != nil {
-		return errors.New("排期日期无效")
+		return domain.ErrSlotDateInvalid
 	}
-	today := time.Now()
-	horizon := intSetting(policy["planning_horizon_days"], 14)
-	if date < today.Format("2006-01-02") || date > today.AddDate(0, 0, horizon-1).Format("2006-01-02") {
-		return errors.New("计划日期超出规则集排期周期")
-	}
-	if !hasString(stringValues(policy["weekdays"]), weekdayName(planned.Weekday())) {
-		return errors.New("计划日期不符合规则集允许星期")
-	}
-	if !hasString(stringValues(policy["time_windows"]), clock) {
-		return errors.New("计划时间不符合规则集允许时间窗")
-	}
-	maxDaily := intSetting(policy["max_per_day"], 2)
 	var daily int
-	if err = s.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schedule WHERE team_id=$1 AND status='待发布' AND planned_date=$2::date`, teamID, date).Scan(&daily); err != nil {
+	if err = s.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schedule WHERE team_id=$1 AND status='待发布' AND planned_date=$2::date AND ($3='' OR id<>$3)`, teamID, date, excludeScheduleID).Scan(&daily); err != nil {
 		return err
 	}
-	if maxDaily > 0 && daily >= maxDaily {
-		return errors.New("计划日期超过规则集每日发布频率")
-	}
-	maxWeekly := intSetting(policy["max_per_platform_per_week"], 2)
 	year, week := planned.ISOWeek()
 	var weekly int
-	if err = s.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schedule WHERE team_id=$1 AND status='待发布' AND platform=$2 AND EXTRACT(ISOYEAR FROM planned_date)=$3 AND EXTRACT(WEEK FROM planned_date)=$4`, teamID, platform, year, week).Scan(&weekly); err != nil {
+	if err = s.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schedule WHERE team_id=$1 AND status='待发布' AND platform=$2 AND EXTRACT(ISOYEAR FROM planned_date)=$3 AND EXTRACT(WEEK FROM planned_date)=$4 AND ($5='' OR id<>$5)`, teamID, platform, year, week, excludeScheduleID).Scan(&weekly); err != nil {
 		return err
 	}
-	if maxWeekly > 0 && weekly >= maxWeekly {
-		return errors.New("计划日期超过该平台每周发布频率")
-	}
-	return nil
-}
-
-func stringValues(raw any) []string {
-	values, _ := raw.([]any)
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		if text, ok := value.(string); ok {
-			result = append(result, text)
-		}
-	}
-	return result
-}
-
-func intSetting(raw any, fallback int) int {
-	if value, ok := raw.(float64); ok {
-		return int(value)
-	}
-	return fallback
-}
-func hasString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
+	return rules.Rules().ValidateSlot(window, date, clock, domain.SlotCounts{SameDay: daily + 1, SamePlatformSameISOWeek: weekly + 1})
 }
 
 func (s *Server) adoptSchedules(w http.ResponseWriter, r *http.Request) {
@@ -1751,6 +2094,10 @@ func (s *Server) adoptSchedules(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
+	if strings.TrimSpace(input.RecommendationID) == "" {
+		writeError(w, r, 422, "recommendation_required", "缺少排期建议 ID")
+		return
+	}
 	items := make([]repository.AdoptedSchedule, 0, len(input.Items))
 	for _, row := range input.Items {
 		item := repository.AdoptedSchedule{}
@@ -1758,21 +2105,19 @@ func (s *Server) adoptSchedules(w http.ResponseWriter, r *http.Request) {
 		item.PlannedDate, _ = row["planned_date"].(string)
 		item.TimeSlot, _ = row["time_slot"].(string)
 		item.Title, _ = row["title"].(string)
+		if strings.TrimSpace(item.TargetContentID) == "" {
+			writeError(w, r, 422, "invalid_item", "建议条目缺少目标内容")
+			return
+		}
 		items = append(items, item)
 	}
-	var raw []byte
-	err := s.Store.DB.QueryRowContext(r.Context(), `SELECT payload_json->'schedule_policy' FROM system_rule_set WHERE enabled=TRUE ORDER BY updated_at DESC LIMIT 1`).Scan(&raw)
+	policy, _, err := s.loadPlanningRules(r.Context())
 	if err != nil {
-		writeError(w, r, 503, "schedule_rules_unavailable", "数据库中没有可用的只读排期规则集")
-		return
-	}
-	var policy map[string]any
-	if err = json.Unmarshal(raw, &policy); err != nil {
-		writeError(w, r, 503, "schedule_rules_invalid", "排期规则集格式无效")
+		writeRuleSetError(w, r, err)
 		return
 	}
 	c := claimsFrom(r)
-	created, err := s.Store.AdoptRecommendations(r.Context(), c.TeamID, c.UserID, c.Name, input.RecommendationID, items, policy)
+	outcome, err := s.Store.AdoptRecommendations(r.Context(), c.TeamID, c.UserID, c.Name, input.RecommendationID, items, policy.Rules())
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, r, 404, "recommendation_not_found", "排期建议不存在")
@@ -1781,7 +2126,7 @@ func (s *Server) adoptSchedules(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSON(w, 200, map[string]int{"created": created})
+	writeJSON(w, 200, map[string]any{"created": outcome.Created, "recommendations": outcome.Recommendations})
 }
 
 func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
@@ -1789,15 +2134,45 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &fields) {
 		return
 	}
-	if date, ok := fields["planned_date"].(string); ok {
-		parsed, err := repository.ParseScheduleDate(date)
+	c := claimsFrom(r)
+	scheduleID := r.PathValue("id")
+	date, hasDate := fields["planned_date"].(string)
+	clock, hasClock := fields["planned_time"].(string)
+	if hasDate {
+		parsed, err := repository.ParsePlannedDate(date)
 		if err != nil {
 			writeError(w, r, 422, "invalid_date", err.Error())
 			return
 		}
+		date = parsed
 		fields["planned_date"] = parsed
 	}
-	item, err := s.Store.UpdateSchedule(r.Context(), claimsFrom(r).TeamID, r.PathValue("id"), fields)
+	if hasDate || hasClock {
+		var storedDate, storedClock, storedPlatform string
+		if err := s.Store.DB.QueryRowContext(r.Context(), `SELECT to_char(planned_date,'YYYY-MM-DD'),planned_time,platform FROM schedule WHERE id=$1 AND team_id=$2`, scheduleID, c.TeamID).Scan(&storedDate, &storedClock, &storedPlatform); err != nil {
+			notFoundOrError(w, r, err, "排期不存在")
+			return
+		}
+		if !hasDate {
+			date = storedDate
+		}
+		if !hasClock {
+			clock = storedClock
+		}
+		platform := storedPlatform
+		if value, ok := fields["platform"].(string); ok && strings.TrimSpace(value) != "" {
+			platform = value
+		}
+		if _, err := time.Parse("15:04", clock); err != nil {
+			writeError(w, r, 422, "invalid_time", "发布时间格式必须为 HH:MM")
+			return
+		}
+		if err := s.validateSlot(r.Context(), c.TeamID, date, clock, platform, scheduleID); err != nil {
+			writeRuleSetError(w, r, err)
+			return
+		}
+	}
+	item, err := s.Store.UpdateSchedule(r.Context(), c.TeamID, scheduleID, fields)
 	if err != nil {
 		notFoundOrError(w, r, err, "排期不存在或更新失败")
 		return
@@ -1853,7 +2228,10 @@ func (s *Server) publishSchedule(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request) {
 	c := claimsFrom(r)
-	rows, err := s.Store.QueryMaps(r.Context(), `SELECT id,title,category,platform,owner,lifecycle,workflow_state FROM content WHERE team_id=$1 AND lifecycle='未发布' AND workflow_state<>'已发布' AND NOT EXISTS (SELECT 1 FROM schedule WHERE schedule.team_id=content.team_id AND schedule.content_id=content.id AND schedule.status='待发布') ORDER BY created_at`, c.TeamID)
+	// Schedule suggestions only cover content waiting for a schedule; every other
+	// workflow state is filtered out in the query, so the rule cannot be bypassed
+	// by the client.
+	rows, err := s.Store.QueryMaps(r.Context(), `SELECT id,title,category,platform,owner,lifecycle,workflow_state FROM content WHERE team_id=$1 AND lifecycle='未发布' AND workflow_state='待排期' AND NOT EXISTS (SELECT 1 FROM schedule WHERE schedule.team_id=content.team_id AND schedule.content_id=content.id AND schedule.status='待发布') ORDER BY created_at`, c.TeamID)
 	if err != nil {
 		writeError(w, r, 500, "candidate_query_failed", "读取待排期内容失败")
 		return
@@ -1862,15 +2240,9 @@ func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request)
 	for _, row := range rows {
 		candidates = append(candidates, domain.Content{ID: fmt.Sprint(row["id"]), Title: fmt.Sprint(row["title"]), Category: fmt.Sprint(row["category"]), Platform: fmt.Sprint(row["platform"]), Owner: fmt.Sprint(row["owner"]), Lifecycle: fmt.Sprint(row["lifecycle"]), WorkflowState: fmt.Sprint(row["workflow_state"])})
 	}
-	var policy service.SlotPolicy
-	var rawPolicy []byte
-	err = s.Store.DB.QueryRowContext(r.Context(), `SELECT payload_json->'schedule_policy' FROM system_rule_set WHERE enabled=TRUE ORDER BY updated_at DESC LIMIT 1`).Scan(&rawPolicy)
-	if err != nil {
-		writeError(w, r, 503, "schedule_rules_unavailable", "数据库中没有可用的只读排期规则集")
-		return
-	}
-	if err = json.Unmarshal(rawPolicy, &policy); err != nil || policy.HorizonDays < 1 || len(policy.TimeWindows) == 0 {
-		writeError(w, r, 503, "schedule_rules_invalid", "排期规则集字段无效")
+	policy, window, ruleErr := s.loadPlanningRules(r.Context())
+	if ruleErr != nil {
+		writeRuleSetError(w, r, ruleErr)
 		return
 	}
 	policy.ExistingDaily = map[string]int{}
@@ -1948,6 +2320,7 @@ func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request)
 		fallbackReason = "当前团队没有可排期的未发布内容。"
 		selected = []service.Suggestion{}
 	}
+	selected = s.annotateSuggestionValidity(r.Context(), c.TeamID, selected, policy, window)
 	referenceCount := 0
 	for _, item := range selected {
 		referenceCount += item.ReferenceSampleCount
@@ -1970,6 +2343,113 @@ func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request)
 		confidenceNote = "基于同团队历史数据；结果不构成效果保证。"
 	}
 	writeJSON(w, 200, map[string]any{"id": id, "source": sourceLabel, "source_label": sourceLabel, "analysis_status": status, "reference_count": referenceCount, "confidence": "low", "confidence_note": confidenceNote, "fallback_reason": fallbackReason, "recommendations": selected})
+}
+
+// annotateSuggestionValidity re-checks each generated suggestion against the
+// current rule set and team data. The reason comes from the same validation the
+// adoption endpoint applies, so the client can disable the item and explain why
+// instead of guessing. Target state and existing plans are loaded in two batched
+// queries, so suggestion generation stays a single round trip per table even for
+// large candidate lists.
+func (s *Server) annotateSuggestionValidity(ctx context.Context, teamID int64, items []service.Suggestion, policy service.SlotPolicy, window domain.PlanningWindow) []service.Suggestion {
+	rules := policy.Rules()
+	targetIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.TargetContentID != "" {
+			targetIDs = append(targetIDs, item.TargetContentID)
+		}
+	}
+	targets := map[string]suggestionTarget{}
+	scheduled := map[string]bool{}
+	if len(targetIDs) > 0 {
+		rows, err := s.Store.QueryMaps(ctx, `SELECT id,lifecycle,workflow_state,platform FROM content WHERE team_id=$1 AND id = ANY($2)`, teamID, targetIDs)
+		if err != nil {
+			return items
+		}
+		for _, row := range rows {
+			targets[stringField(row, "id")] = suggestionTarget{Lifecycle: stringField(row, "lifecycle"), WorkflowState: stringField(row, "workflow_state"), Platform: stringField(row, "platform")}
+		}
+		rows, err = s.Store.QueryMaps(ctx, `SELECT content_id FROM schedule WHERE team_id=$1 AND status='待发布' AND content_id = ANY($2)`, teamID, targetIDs)
+		if err != nil {
+			return items
+		}
+		for _, row := range rows {
+			scheduled[stringField(row, "content_id")] = true
+		}
+	}
+	dayCounts := map[string]int{}
+	for date, count := range policy.ExistingDaily {
+		dayCounts[date] = count
+	}
+	weekCounts := map[string]int{}
+	for key, count := range policy.ExistingPlatformWeekly {
+		weekCounts[key] = count
+	}
+	annotated := make([]service.Suggestion, 0, len(items))
+	for _, item := range items {
+		reason, date, platform := suggestionBlockReason(item, rules, window, targets, scheduled, dayCounts, weekCounts)
+		item.InvalidReason = reason
+		if reason == "" {
+			consumeSlot(date, platform, dayCounts, weekCounts)
+		}
+		annotated = append(annotated, item)
+	}
+	return annotated
+}
+
+// suggestionTarget is the preloaded planning state of one suggested target.
+type suggestionTarget struct {
+	Lifecycle     string
+	WorkflowState string
+	Platform      string
+}
+
+// suggestionBlockReason returns the first blocking reason for a suggestion, or
+// an empty string when it can be adopted now. It is a pure function so the
+// pre-check can be tested without a database.
+func suggestionBlockReason(item service.Suggestion, rules domain.PlanningRules, window domain.PlanningWindow, targets map[string]suggestionTarget, scheduled map[string]bool, dayCounts, weekCounts map[string]int) (string, string, string) {
+	date, err := repository.ParsePlannedDate(item.PlannedDate)
+	if err != nil {
+		return "计划日期格式无效", "", ""
+	}
+	if strings.TrimSpace(item.TargetContentID) == "" {
+		return "建议缺少目标内容", date, ""
+	}
+	target, ok := targets[item.TargetContentID]
+	if !ok {
+		return "目标内容不存在或不属于当前团队", date, ""
+	}
+	platform := target.Platform
+	if target.Lifecycle != domain.LifecycleUnpublished || target.WorkflowState == domain.WorkflowPublished {
+		return "目标内容已发布，无需排期", date, platform
+	}
+	if !domain.CanSuggestSchedule(target.Lifecycle, target.WorkflowState) {
+		return fmt.Sprintf("排期建议仅针对待排期内容（当前状态：%s）", target.WorkflowState), date, platform
+	}
+	if scheduled[item.TargetContentID] {
+		return "该内容已有待发布排期", date, platform
+	}
+	planned, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return "计划日期格式无效", date, platform
+	}
+	year, week := planned.ISOWeek()
+	counts := domain.SlotCounts{SameDay: dayCounts[date] + 1, SamePlatformSameISOWeek: weekCounts[fmt.Sprintf("%s:%d:%d", platform, year, week)] + 1}
+	if err = rules.ValidateSlot(window, date, item.TimeSlot, counts); err != nil {
+		return err.Error(), date, platform
+	}
+	return "", date, platform
+}
+
+// consumeSlot reserves capacity for one accepted suggestion.
+func consumeSlot(date, platform string, dayCounts, weekCounts map[string]int) {
+	dayCounts[date]++
+	parsed, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return
+	}
+	year, week := parsed.ISOWeek()
+	weekCounts[fmt.Sprintf("%s:%d:%d", platform, year, week)]++
 }
 
 type aiModelConfig struct {
@@ -2076,13 +2556,17 @@ func (s *Server) callAI(ctx context.Context, model aiModelConfig, key string, ca
 	}
 	usedContent := map[string]bool{}
 	result := make([]service.Suggestion, 0, len(generated.Recommendations))
+	window, windowOK := policy.Window(time.Now())
+	if !windowOK {
+		return nil, errors.New("排期规则集缺少有效周期")
+	}
 	for _, item := range generated.Recommendations {
 		candidate, ok := byID[item.TargetContentID]
 		if !ok || usedContent[item.TargetContentID] || !allowedTimes[item.TimeSlot] || strings.TrimSpace(item.Reason) == "" {
 			return nil, errors.New("模型建议包含无效内容或时间")
 		}
 		planned, parseErr := time.Parse("2006-01-02", item.PlannedDate)
-		if parseErr != nil || planned.Before(time.Now().AddDate(0, 0, 1).Truncate(24*time.Hour)) || planned.After(time.Now().AddDate(0, 0, policy.HorizonDays)) || len(allowedWeekdays) > 0 && !allowedWeekdays[weekdayName(planned.Weekday())] {
+		if parseErr != nil || !window.Contains(item.PlannedDate) || len(allowedWeekdays) > 0 && !allowedWeekdays[weekdayName(planned.Weekday())] {
 			return nil, errors.New("模型建议日期超出规则时间范围")
 		}
 		usedDaily[item.PlannedDate]++

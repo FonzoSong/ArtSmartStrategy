@@ -19,6 +19,23 @@ type SlotPolicy struct {
 	ExistingPlatformWeekly map[string]int `json:"-"`
 }
 
+// Rules projects the policy onto the shared planning rules used by every
+// scheduling entry point (recommendations, manual plans, adoption, AI output).
+func (p SlotPolicy) Rules() domain.PlanningRules {
+	return domain.PlanningRules{
+		HorizonDays:           p.HorizonDays,
+		Weekdays:              p.Weekdays,
+		TimeWindows:           p.TimeWindows,
+		MaxPerDay:             p.MaxPerDay,
+		MaxPerPlatformPerWeek: p.MaxPerPlatformPerWeek,
+	}
+}
+
+// Window derives the inclusive planning window for this policy at the given time.
+func (p SlotPolicy) Window(now time.Time) (domain.PlanningWindow, bool) {
+	return domain.HorizonWindow(now, p.HorizonDays)
+}
+
 // PerformanceSample contains only a current-team published asset.
 type PerformanceSample struct {
 	Category    string
@@ -47,12 +64,20 @@ type Suggestion struct {
 	ReferenceSampleCount int    `json:"reference_sample_count"`
 	Confidence           string `json:"confidence"`
 	Limitations          string `json:"limitations"`
+	// InvalidReason is filled in by the API after generation. A non-empty value
+	// means the item must not be adopted until the reason is resolved.
+	InvalidReason string `json:"invalid_reason,omitempty"`
+	// Adopted marks items already written to the calendar during a partial adoption.
+	Adopted    bool   `json:"adopted,omitempty"`
+	ScheduleID string `json:"schedule_id,omitempty"`
 }
 
 // BuildRuleSuggestions schedules only unpublished assets against matching
 // same-team published performance samples. It is deterministic for its inputs.
 func BuildRuleSuggestions(now time.Time, candidates []domain.Content, samples []PerformanceSample, policy SlotPolicy) []Suggestion {
-	if policy.HorizonDays < 1 || policy.HorizonDays > 90 || len(policy.TimeWindows) == 0 {
+	rules := policy.Rules()
+	window, valid := domain.HorizonWindow(now, rules.HorizonDays)
+	if !valid || len(rules.TimeWindows) == 0 {
 		return []Suggestion{}
 	}
 	type scoredSlot struct {
@@ -75,22 +100,24 @@ func BuildRuleSuggestions(now time.Time, candidates []domain.Content, samples []
 			continue
 		}
 		var slots []scoredSlot
-		for offset := 1; offset <= policy.HorizonDays; offset++ {
-			day := now.AddDate(0, 0, offset)
+		for _, day := range window.Dates() {
 			date := day.Format("2006-01-02")
-			if usedPerDay[date] >= policy.MaxPerDay && policy.MaxPerDay > 0 {
+			if usedPerDay[date] >= rules.MaxPerDay && rules.MaxPerDay > 0 {
 				continue
 			}
-			weekday := weekdayLabel(day.Weekday())
-			if len(policy.Weekdays) > 0 && !contains(policy.Weekdays, weekday) {
+			weekday := domain.WeekdayLabel(day.Weekday())
+			if len(rules.Weekdays) > 0 && !domain.ContainsString(rules.Weekdays, weekday) {
 				continue
 			}
 			year, week := day.ISOWeek()
 			weekKey := candidate.Platform + ":" + strconv.Itoa(year) + ":" + strconv.Itoa(week)
-			if policy.MaxPerPlatformPerWeek > 0 && usedPerWeek[weekKey] >= policy.MaxPerPlatformPerWeek {
+			if rules.MaxPerPlatformPerWeek > 0 && usedPerWeek[weekKey] >= rules.MaxPerPlatformPerWeek {
 				continue
 			}
-			for _, clock := range policy.TimeWindows {
+			for _, clock := range rules.TimeWindows {
+				if clockAlreadyPassed(now, day, clock) {
+					continue
+				}
 				var score float64
 				count := 0
 				for _, sample := range samples {
@@ -145,7 +172,20 @@ func BuildRuleSuggestions(now time.Time, candidates []domain.Content, samples []
 	return result
 }
 
-func weekdayLabel(day time.Weekday) string {
-	return [...]string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}[day]
+// clockAlreadyPassed reports whether a slot on the current day has already
+// started. Recommendations never propose a time that is already in the past;
+// manual planning may still record a same-day plan explicitly.
+func clockAlreadyPassed(now, day time.Time, clock string) bool {
+	nowYear, nowMonth, nowDay := now.Date()
+	dayYear, dayMonth, dayDate := day.Date()
+	if nowYear != dayYear || nowMonth != dayMonth || nowDay != dayDate {
+		return false
+	}
+	parsed, err := time.Parse("15:04", clock)
+	if err != nil {
+		return false
+	}
+	return now.Hour()*60+now.Minute() >= parsed.Hour()*60+parsed.Minute()
 }
+
 func itoa(value int) string { return strconv.Itoa(value) }
