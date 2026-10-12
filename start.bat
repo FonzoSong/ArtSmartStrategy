@@ -36,6 +36,6 @@ if not "%START_RESULT%"=="0" (
   exit /b %START_RESULT%
 )
 
-echo ArtSmart is ready at http://localhost:8081/ by default.
-echo API health is available at http://localhost:8081/api/health/ready.
+echo ArtSmart is ready at http://localhost/ and http://127.0.0.1/ by default.
+echo API health is available at http://localhost/api/health/ready.
 endlocal

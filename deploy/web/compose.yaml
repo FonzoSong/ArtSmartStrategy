@@ -1,0 +1,22 @@
+services:
+  web:
+    image: artsmart-web:0.4.0
+    build:
+      context: ../../web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ""
+        NGINX_CONFIG: nginx.external.conf.template
+        NGINX_CONFIG_DEST: /etc/nginx/templates/default.conf.template
+    environment:
+      API_UPSTREAM: ${API_UPSTREAM:?Set API_UPSTREAM to the API private URL}
+      NGINX_ENVSUBST_FILTER: ^API_UPSTREAM$
+    ports:
+      - "${WEB_BIND_ADDRESS:-0.0.0.0}:${WEB_PORT:-80}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped

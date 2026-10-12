@@ -29,14 +29,35 @@ docker compose ps
 docker compose logs -f api
 ```
 
-Windows 可运行 `start.bat`，其执行相同的 Docker Compose 启动流程。Web 默认地址为
-`http://localhost:8081`；API 经同源 `/api` 代理访问。PostgreSQL 使用 `db` 服务名，
+Windows 可运行 `start.bat`，其执行相同的 Docker Compose 启动流程。Web 监听本机 80 端口，
+可通过 `http://localhost/` 或 `http://127.0.0.1/` 访问；API 经同源 `/api` 代理访问。PostgreSQL 使用 `db` 服务名，
 仅加入内部 `db-net`，没有宿主机端口映射。API 运行账号是非超级用户。
 
 `LOAD_EXAMPLE_DATA=true` 仅控制数据库第一次初始化时是否执行
 `db/sql/02_seed_data.sql`。新环境默认导入虚构样例；现有数据库卷不会再次执行初始化脚本。
 该 SQL 可幂等重跑，但不会自动随容器重启执行。不要运行 `docker compose down -v`，除非
 明确要删除数据库卷及其中全部数据。
+
+## 三台服务器独立部署
+
+`deploy/db`、`deploy/api`、`deploy/web` 各自提供 Compose 文件和独立 `.env.example`。将项目
+仓库部署到对应服务器，把对应示例复制为该目录的 `.env` 并填写配置。数据库
+地址使用仅 API 服务器可访问的私有 IP 或 VPN 地址；防火墙限制 5432 仅允许 API 主机，API
+端口 8080 仅允许 Web 主机。不要将数据库端口暴露到公网。Web Nginx 通过配置的
+`API_UPSTREAM` 反向代理 API，浏览器仍访问 Web 的同源 `/api`。
+
+分别在三个服务器执行对应命令（先将 `.env.example` 复制为 `.env`）：
+
+```text
+docker compose --env-file deploy/db/.env -f deploy/db/compose.yaml up --build --detach --wait
+docker compose --env-file deploy/api/.env -f deploy/api/compose.yaml up --build --detach --wait
+docker compose --env-file deploy/web/.env -f deploy/web/compose.yaml up --build --detach --wait
+```
+
+前端服务器需将 `WEB_BIND_ADDRESS` 设为可供用户或 TLS 反向代理访问的接口地址；本机测试
+设为 `127.0.0.1`。API 服务器 `CORS_ALLOWED_ORIGINS` 填写 Web 的完整来源。数据库和 API
+之间应使用私有网络或 VPN，并按示例限制防火墙来源；跨不可信网络部署需配置 PostgreSQL TLS
+并在 `DATABASE_URL` 使用 `sslmode=require`。
 
 ## 本机开发
 

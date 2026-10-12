@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-arts_smart}
+      POSTGRES_USER: ${POSTGRES_USER:-arts_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      APP_DB_USER: ${APP_DB_USER:-arts_app}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD}
+      LOAD_EXAMPLE_DATA: ${LOAD_EXAMPLE_DATA:-false}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../../db/init:/docker-entrypoint-initdb.d:ro
+      - ../../db/sql:/docker-entrypoint-sql:ro
+    ports:
+      - "${DB_BIND_ADDRESS:?Set DB_BIND_ADDRESS to the database private IP}:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    name: ${DB_VOLUME_NAME:-arts-smart-postgres-data}
