@@ -10,7 +10,7 @@
 
 1. 在项目目录复制 `.env.example` 并命名为 `.env`。也可以直接双击 `start.bat`，它会首次创建 `.env` 并打开记事本。
 2. 修改 `.env` 中的 `DATABASE_URL`，填写本机 PostgreSQL 用户、密码、地址和数据库名。
-3. 保存 `.env` 后双击 `start.bat`。脚本会创建 Python 虚拟环境、安装依赖、通过唯一迁移入口完成迁移，再启动网站。数据库不可用或迁移失败时脚本会停止，不会启动一个未迁移的数据库应用。默认不注入测试数据。
+3. 保存 `.env` 后双击 `start.bat`。脚本会创建 Python 虚拟环境、安装依赖并启动网站；数据库可连接时先执行迁移并使用 PostgreSQL，连接失败时改从项目根目录的示例 JSON 启动。默认不注入测试数据。显式 `start.bat --seed` 仍要求可用的 PostgreSQL 数据库。
 4. 浏览器访问 <http://127.0.0.1:8000>。首次访问时创建团队负责人账号。
 
 持久化数据库连接只支持 PostgreSQL，不再接受 SQLite 连接串。示例模式内部使用进程内临时数据库实现可交互演示，不会被当作持久化 PostgreSQL。
@@ -27,7 +27,7 @@ APP_SECRET=replace-this-for-a-shared-deployment
 
 ### PostgreSQL 模式与示例数据模式
 
-数据库和 schema 正常时，页面/API 从 PostgreSQL 读写，修改具备持久性。若直接运行 ASGI 应用且数据库连接不可用，应用在允许示例模式时加载项目根目录 `example/data.json`（由 `example/schema.json` 校验）到进程内临时演示库；页面会显示“示例数据模式”，演示修改仅在当前进程有效，服务重启后重新从示例文件加载。示例模式不会写入、覆盖或回填 PostgreSQL。Docker Compose 将 `REQUIRE_DATABASE=true`，数据库不可用或迁移未完成时应用拒绝启动。示例模式用户、团队和演出关系由 `example/data.json` 提供，可使用文件中的负责人邮箱及 `demo_password` 登录；凭据仅用于本地演示。请勿把示例模式当作生产存储。
+数据库连接成功且迁移完成时，页面/API 从 PostgreSQL 读写，修改具备持久性。数据库未配置或连接不可用时，应用从项目根目录的 `example/data.json`（由 `example/schema.json` 校验）加载本地示例数据并启动；页面会显示“示例数据模式”，修改仅保存在当前进程的临时演示库，重启后从 JSON 文件恢复。示例模式不会写入、覆盖或回填 PostgreSQL。数据库恢复后，重启应用即可重新尝试迁移并切回 PostgreSQL 模式。若数据库可连接但 schema 缺失、迁移失败或版本不匹配，应用会明确失败，不会用示例模式掩盖数据库结构错误。示例模式用户、团队和演出关系由 `example/data.json` 提供，可使用文件中的负责人邮箱及 `demo_password` 登录；凭据仅用于本地演示。请勿把示例模式当作生产存储。
 
 ## Docker 部署
 
@@ -39,7 +39,7 @@ docker compose up --build
 
 服务启动后访问 <http://localhost:8000>。PostgreSQL 数据保存在项目目录的 `postgres-data` 持久化目录，容器重建后仍保留。停止服务可在运行窗口按 Ctrl+C；后台启动可执行 `docker compose up --build -d`，停止容器但保留数据库可执行 `docker compose down`。如需清空数据库目录，请先备份，因为删除目录会永久删除其中数据。
 
-Compose 先等待 `db` 的 `pg_isready` 健康检查通过，再运行一次性 `migrate` 服务；应用服务等待该服务成功退出后才启动。重试只针对 PostgreSQL 连接异常，迁移错误会立即失败。应用启动时只核验 schema，不执行迁移。`db` 是 Compose 网络内的稳定主机名，数据库端口、用户和库名来自 Compose 配置。Docker 自动生成的 `APP_SECRET` 保存在独立的 `app-secret` 命名卷中；`docker compose down` 会保留它和数据库卷。不要使用 `docker compose down -v`，否则会删除这两个持久化卷。
+Compose 保留一个独立的一次性迁移任务，应用等待迁移任务结束，但迁移任务只等待数据库容器启动、不等待 PostgreSQL 健康检查。连接失败时有限重试后以可降级状态结束，应用随后从本地 JSON 启动；迁移脚本或可连接数据库的 schema 错误仍会阻止应用启动。这样同一 Compose 项目的应用副本不会各自并发执行迁移。PostgreSQL 继续保留 `pg_isready` 健康检查，`db` 是 Compose 网络内的稳定主机名。数据库恢复后运行 `docker compose run --rm migrate`，再运行 `docker compose restart artsmart`，即可重新迁移并切换到 PostgreSQL。Docker 自动生成的 `APP_SECRET` 保存在独立的 `app-secret` 命名卷中；`docker compose down` 会保留它和数据库卷。不要使用 `docker compose down -v`，否则会删除这两个持久化卷。
 
 ## 首次登录和测试数据
 

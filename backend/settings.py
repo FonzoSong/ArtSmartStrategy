@@ -99,14 +99,11 @@ DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 configured_database_url = os.getenv("DATABASE_URL")
-DATABASE_CONFIGURED = configured_database_url is None or bool(
-    configured_database_url.strip()
+DATABASE_CONFIGURED = bool(
+    configured_database_url and configured_database_url.strip()
 )
 DATABASE_URL = configured_database_url or (
     "postgresql+psycopg://arts_smart:change-this@localhost:5432/arts_smart"
-)
-DATABASE_REQUIRED = (
-    os.getenv("REQUIRE_DATABASE", "false").strip().lower() == "true"
 )
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.kunyou.asia/v1").rstrip("/")
 AI_MODEL = os.getenv("AI_MODEL", "qwen3.8-max")

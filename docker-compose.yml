@@ -20,7 +20,7 @@ services:
     restart: unless-stopped
   migrate:
     build: .
-    command: ["python", "-m", "backend.container_entrypoint", "migrate"]
+    command: ["python", "-m", "backend.container_entrypoint", "prepare"]
     env_file:
       - .env
     environment:
@@ -32,7 +32,7 @@ services:
       - app-secret:/app/runtime-secret
     depends_on:
       db:
-        condition: service_healthy
+        condition: service_started
     restart: "no"
   artsmart:
     build: .
@@ -43,7 +43,6 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-arts_smart}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-arts_smart}
-      REQUIRE_DATABASE: "true"
       SEED_DATA: ${SEED_DATA:-false}
       APP_SECRET_FILE: /app/runtime-secret/.env
     volumes:

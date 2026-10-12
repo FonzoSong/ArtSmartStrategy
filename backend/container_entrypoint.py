@@ -97,24 +97,53 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Run migration, optional fixture injection, and/or the ASGI server.
 
     Args:
-        argv: Optional command arguments. Supports ``migrate``, ``serve``,
-            and ``all``; defaults to ``all`` for direct Docker compatibility.
+            argv: Optional command arguments. Supports ``migrate``, ``prepare``,
+            ``serve``, and ``all``; defaults to ``all`` for direct startup.
 
     Raises:
         ValueError: If an unknown command is supplied.
     """
     args = list(sys.argv[1:] if argv is None else argv)
     mode = args[0] if args else "all"
-    if len(args) > 1 or mode not in {"migrate", "serve", "all"}:
-        raise ValueError("Usage: container_entrypoint [migrate|serve|all]")
+    if len(args) > 1 or mode not in {"migrate", "prepare", "serve", "all"}:
+        raise ValueError(
+            "Usage: container_entrypoint [migrate|prepare|serve|all]"
+        )
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
-    if mode in {"migrate", "all"}:
-        run_migrations_with_retry()
-        if os.getenv("SEED_DATA", "false").strip().lower() == "true":
+    migration_succeeded = False
+    if mode in {"migrate", "prepare", "all"}:
+        try:
+            run_migrations_with_retry(
+                max_attempts=(3 if mode in {"prepare", "all"} else MAX_ATTEMPTS)
+            )
+            migration_succeeded = True
+        except RuntimeError as exc:
+            if mode not in {"prepare", "all"} or not isinstance(
+                exc.__cause__, OperationalError
+            ):
+                raise
+            LOGGER.warning(
+                "PostgreSQL is unavailable after migration retries; starting "
+                "the ASGI app, which will load local example JSON"
+            )
+        if (
+            migration_succeeded
+            and os.getenv("SEED_DATA", "false").strip().lower() == "true"
+        ):
             _seed_data()
+        elif (
+            mode in {"prepare", "all"}
+            and os.getenv("SEED_DATA", "false").strip().lower() == "true"
+        ):
+            LOGGER.warning(
+                "SEED_DATA was requested but PostgreSQL is unavailable; "
+                "the external example JSON will be used read-only instead"
+            )
+    if mode == "prepare":
+        return
     if mode in {"serve", "all"}:
         os.execvpe(
             sys.executable,

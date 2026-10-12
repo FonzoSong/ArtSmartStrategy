@@ -14,7 +14,6 @@ def test_startup_only_verifies_schema_and_does_not_run_migrations(
     """Only the dedicated migration entrypoint may execute Alembic upgrades."""
     calls: list[str] = []
     monkeypatch.setattr(main, "DATABASE_CONFIGURED", True)
-    monkeypatch.setattr(main, "DATABASE_REQUIRED", True)
     monkeypatch.setattr(
         main, "verify_database_ready", lambda: calls.append("verify")
     )
@@ -24,6 +23,45 @@ def test_startup_only_verifies_schema_and_does_not_run_migrations(
     assert calls == ["verify"]
 
 
+def test_startup_uses_local_example_data_when_database_is_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent database URL does not prevent the web app from starting."""
+    calls: list[str] = []
+    monkeypatch.setattr(main, "DATABASE_CONFIGURED", False)
+    monkeypatch.setattr(
+        main, "use_example_mode", lambda: calls.append("example")
+    )
+
+    main.startup()
+
+    assert calls == ["example"]
+
+
+def test_startup_falls_back_to_example_data_when_postgres_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection error selects local JSON-backed demo data."""
+    from sqlalchemy.exc import OperationalError
+
+    calls: list[str] = []
+    monkeypatch.setattr(main, "DATABASE_CONFIGURED", True)
+    monkeypatch.setattr(
+        main,
+        "verify_database_ready",
+        lambda: (_ for _ in ()).throw(
+            OperationalError("connect", {}, OSError("connection refused"))
+        ),
+    )
+    monkeypatch.setattr(
+        main, "use_example_mode", lambda: calls.append("example")
+    )
+
+    main.startup()
+
+    assert calls == ["example"]
+
+
 def test_startup_refuses_to_serve_an_unmigrated_database(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -31,7 +69,6 @@ def test_startup_refuses_to_serve_an_unmigrated_database(
     from backend.database import DatabaseSchemaError
 
     monkeypatch.setattr(main, "DATABASE_CONFIGURED", True)
-    monkeypatch.setattr(main, "DATABASE_REQUIRED", True)
     monkeypatch.setattr(
         main,
         "verify_database_ready",

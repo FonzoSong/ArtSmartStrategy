@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import pytest
+from backend import container_entrypoint
 from backend.container_entrypoint import run_migrations_with_retry
 from sqlalchemy.exc import OperationalError
 
@@ -67,3 +68,80 @@ def test_retry_limit_must_be_positive() -> None:
     """Invalid retry configuration is rejected before running migrations."""
     with pytest.raises(ValueError, match="at least one"):
         run_migrations_with_retry(max_attempts=0)
+
+
+def test_all_mode_starts_app_when_database_connection_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compose startup serves the app in local example mode during outages."""
+    executed: list[list[str]] = []
+
+    def unavailable_migration(**_: object) -> None:
+        cause = OperationalError("connect", {}, OSError("connection refused"))
+        raise RuntimeError("PostgreSQL unavailable") from cause
+
+    monkeypatch.setattr(
+        container_entrypoint,
+        "run_migrations_with_retry",
+        unavailable_migration,
+    )
+    monkeypatch.setattr(
+        container_entrypoint.os,
+        "execvpe",
+        lambda _exe, args, _env: executed.append(list(args)),
+    )
+    monkeypatch.setenv("SEED_DATA", "false")
+
+    container_entrypoint.main(["all"])
+
+    assert executed
+    assert "uvicorn" in executed[0]
+
+
+def test_all_mode_does_not_hide_a_migration_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Schema and migration failures remain fatal rather than using JSON."""
+    monkeypatch.setattr(
+        container_entrypoint,
+        "run_migrations_with_retry",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("bad migration")),
+    )
+    with pytest.raises(RuntimeError, match="bad migration"):
+        container_entrypoint.main(["all"])
+
+
+def test_prepare_mode_returns_success_after_connection_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Compose migration job can finish so app fallback can start."""
+    calls: list[int] = []
+
+    def unavailable_migration(**kwargs: object) -> None:
+        calls.append(int(kwargs["max_attempts"]))
+        cause = OperationalError("connect", {}, OSError("connection refused"))
+        raise RuntimeError("PostgreSQL unavailable") from cause
+
+    monkeypatch.setattr(
+        container_entrypoint,
+        "run_migrations_with_retry",
+        unavailable_migration,
+    )
+    monkeypatch.setenv("SEED_DATA", "false")
+
+    container_entrypoint.main(["prepare"])
+
+    assert calls == [3]
+
+
+def test_prepare_mode_does_not_hide_migration_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken migration is still fatal to the one-shot Compose job."""
+    monkeypatch.setattr(
+        container_entrypoint,
+        "run_migrations_with_retry",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("bad migration")),
+    )
+    with pytest.raises(RuntimeError, match="bad migration"):
+        container_entrypoint.main(["prepare"])

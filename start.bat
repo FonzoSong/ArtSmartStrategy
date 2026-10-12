@@ -40,6 +40,8 @@ if errorlevel 1 goto :failed
 call .venv\Scripts\python.exe -c "import backend.settings"
 if errorlevel 1 goto :failed
 
+if not defined SEED_FLAG goto :normal_start
+
 set "SEED_DATA=false"
 call .venv\Scripts\python.exe -m backend.container_entrypoint migrate
 if errorlevel 1 goto :failed
@@ -55,6 +57,12 @@ if defined SEED_FLAG if not defined FORCE_FLAG (
 
 echo Starting Artsmart at http://127.0.0.1:8000
 call .venv\Scripts\python.exe -m backend.container_entrypoint serve
+goto :finished
+
+:normal_start
+echo Starting Artsmart at http://127.0.0.1:8000
+echo PostgreSQL will be used when reachable; otherwise the local example JSON will start in read-only demo mode.
+call .venv\Scripts\python.exe -m backend.container_entrypoint all
 goto :finished
 
 :failed

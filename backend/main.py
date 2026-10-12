@@ -107,7 +107,6 @@ from backend.settings import (
     AI_BASE_URL,
     AI_MODEL,
     DATABASE_CONFIGURED,
-    DATABASE_REQUIRED,
     MIN_SAMPLE_DEFAULT,
     PLATFORMS,
     ROOT,
@@ -624,12 +623,10 @@ def report_pdf(
 
 
 def startup() -> None:
-    """Verify migrated database readiness or enter example mode if allowed."""
+    """Verify PostgreSQL readiness or load local example data on outage."""
     from sqlalchemy.exc import SQLAlchemyError
 
     if not DATABASE_CONFIGURED:
-        if DATABASE_REQUIRED:
-            raise RuntimeError("REQUIRE_DATABASE=true，但 DATABASE_URL 未配置")
         logger.warning("DATABASE_URL is empty; entering example data mode")
         use_example_mode()
         return
@@ -643,15 +640,11 @@ def startup() -> None:
             "refusing to start before migrations succeed"
         )
         raise
-    except SQLAlchemyError as exc:
-        if DATABASE_REQUIRED:
-            logger.exception(
-                "Required PostgreSQL is unavailable; refusing to start"
-            )
-            raise RuntimeError(
-                "Required PostgreSQL is unavailable during application startup"
-            ) from exc
-        logger.exception("Database startup failed; checking example mode")
+    except SQLAlchemyError:
+        logger.exception(
+            "PostgreSQL is unavailable; starting from validated local example "
+            "JSON. The application will not write to PostgreSQL in this mode"
+        )
         try:
             use_example_mode()
         except RuntimeError as example_error:
