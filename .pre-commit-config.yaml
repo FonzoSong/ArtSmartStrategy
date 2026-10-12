@@ -1,22 +1,13 @@
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.13
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.15.0
-    hooks:
-      - id: mypy
-        additional_dependencies:
-          - fastapi>=0.115,<1
-          - pydantic>=2.10,<3
-          - sqlalchemy>=2,<3
   - repo: local
     hooks:
-      - id: pytest
-        name: pytest
-        entry: pytest -q
+      - id: gofmt
+        name: gofmt
+        entry: gofmt -w
+        language: system
+        types: [go]
+      - id: go-test
+        name: go test
+        entry: go test ./cmd/api ./internal/config ./internal/domain ./internal/httpapi ./internal/migrate ./internal/repository ./internal/service ./tools
         language: system
         pass_filenames: false
