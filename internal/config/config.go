@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// Config contains runtime settings for the API and cloud PostgreSQL service.
+// Config contains runtime settings for the API and PostgreSQL service.
 type Config struct {
 	Address        string
 	DatabaseURL    string
@@ -25,7 +25,7 @@ type Config struct {
 	AIAPIKey       string
 }
 
-// Load reads environment variables and refuses local or implicit databases.
+// Load reads and validates environment-backed service configuration.
 func Load() (Config, error) {
 	cfg := Config{
 		Address:        envOr("API_ADDR", ":8080"),
@@ -40,7 +40,7 @@ func Load() (Config, error) {
 		AIAPIKey:       os.Getenv("AI_API_KEY"),
 	}
 	if cfg.DatabaseURL == "" {
-		return Config{}, errors.New("DATABASE_URL must point to the managed PostgreSQL service")
+		return Config{}, errors.New("DATABASE_URL must point to the PostgreSQL service")
 	}
 	parsed, err := url.Parse(cfg.DatabaseURL)
 	if err != nil || parsed.Scheme != "postgres" && parsed.Scheme != "postgresql" {

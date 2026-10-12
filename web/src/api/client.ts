@@ -1,6 +1,6 @@
 import type { ApiErrorBody } from "../types/domain";
 
-const baseURL = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8080")
+const baseURL = (import.meta.env.VITE_API_BASE_URL || "")
   .replace(/\/$/, "");
 
 export class APIError extends Error {

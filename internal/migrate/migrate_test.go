@@ -1,17 +1,23 @@
 package migrate
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestEmbeddedMigrationsAreOrderedAndComplete(t *testing.T) {
 	migrations, err := loadMigrations()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) < 2 {
-		t.Fatalf("expected schema and rule seed migrations, got %d", len(migrations))
+	if len(migrations) < 3 {
+		t.Fatalf("expected schema, rule seed, and cleanup migrations, got %d", len(migrations))
 	}
-	if migrations[0].version != "0001_initial" || migrations[1].version != "0002_seed_rules" {
+	if migrations[0].version != "0001_initial" || migrations[1].version != "0002_seed_rules" || migrations[2].version != "0003_remove_import_only_rules" {
 		t.Fatalf("unexpected migration order: %#v", migrations)
+	}
+	if !strings.Contains(migrations[2].sql, "content.import") {
+		t.Fatal("cleanup migration does not remove rules tied to file import")
 	}
 }
 

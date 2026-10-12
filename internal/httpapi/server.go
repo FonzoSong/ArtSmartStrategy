@@ -63,7 +63,6 @@ func New(cfg config.Config, store *repository.Postgres, logger *slog.Logger) htt
 	mux.Handle("DELETE /api/contents/{id}", server.authenticated(server.editors(http.HandlerFunc(server.deleteContent))))
 	mux.Handle("POST /api/contents/{id}/advance", server.authenticated(server.editors(http.HandlerFunc(server.advanceContent))))
 	mux.Handle("POST /api/contents/bulk", server.authenticated(server.editors(http.HandlerFunc(server.bulkContents))))
-	mux.Handle("POST /api/contents/import-csv", server.authenticated(server.editors(http.HandlerFunc(server.importContentsCSV))))
 	mux.Handle("GET /api/teams", server.authenticated(http.HandlerFunc(server.teams)))
 	mux.Handle("GET /api/users", server.authenticated(http.HandlerFunc(server.users)))
 	mux.Handle("POST /api/users", server.authenticated(server.owners(http.HandlerFunc(server.addUser))))
@@ -172,7 +171,7 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runtimeMode(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"mode": "database", "persistent": true, "message": "云端 PostgreSQL 数据库模式：修改将持久化保存。"})
+	writeJSON(w, http.StatusOK, map[string]any{"mode": "database", "persistent": true, "message": "PostgreSQL 数据库模式：修改将持久化保存。"})
 }
 
 func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
@@ -470,82 +469,6 @@ func (s *Server) bulkContents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"updated": len(input.IDs)})
 }
 
-func (s *Server) importContentsCSV(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 12<<20)
-	file, _, err := r.FormFile("file")
-	if err != nil {
-		writeError(w, r, 400, "csv_missing", "请选择 CSV 文件")
-		return
-	}
-	defer file.Close()
-	reader := csv.NewReader(io.LimitReader(file, 10<<20))
-	reader.FieldsPerRecord = -1
-	header, err := reader.Read()
-	if err != nil {
-		writeError(w, r, 422, "csv_invalid", "CSV 文件为空或格式无效")
-		return
-	}
-	columns := map[string]int{}
-	for i, name := range header {
-		columns[strings.TrimPrefix(strings.TrimSpace(name), "\ufeff")] = i
-	}
-	warnings := []map[string]any{}
-	imported := 0
-	c := claimsFrom(r)
-	line := 1
-	for {
-		row, readErr := reader.Read()
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		line++
-		if readErr != nil {
-			warnings = append(warnings, map[string]any{"row": line, "message": "CSV 行无法解析"})
-			continue
-		}
-		cell := func(name string) string {
-			if index, ok := columns[name]; ok && index < len(row) {
-				return strings.TrimSpace(row[index])
-			}
-			return ""
-		}
-		status := cell("状态标签")
-		if status == "" {
-			status = domain.LifecyclePublished
-		}
-		lifecycle := domain.LifecycleUnpublished
-		if status == domain.LifecyclePublished {
-			lifecycle = domain.LifecyclePublished
-		}
-		workflow := cell("工作流状态")
-		if workflow == "" {
-			if lifecycle == domain.LifecyclePublished {
-				workflow = domain.WorkflowPublished
-			} else {
-				workflow = domain.WorkflowUnpublished
-			}
-		}
-		publishedAt := time.Now()
-		for _, layout := range []string{"2006-01-02 15:04", "2006-01-02 15:04:05", time.RFC3339Nano} {
-			if parsed, parseErr := time.Parse(layout, cell("发布时间")); parseErr == nil {
-				publishedAt = parsed
-				break
-			}
-		}
-		content := domain.Content{Title: cell("标题"), Category: cell("内容类型"), Platform: cell("平台"), PublishedAt: publishedAt, Duration: parseInt(cell("时长")), Views: int64(parseInt(cell("播放量"))), Likes: int64(parseInt(cell("点赞量"))), Comments: int64(parseInt(cell("评论量"))), Saves: int64(parseInt(cell("收藏量"))), Shares: int64(parseInt(cell("转发量"))), Completion: parseFloat(cell("看完比例")), Lifecycle: lifecycle, WorkflowState: workflow, Tags: splitTags(cell("标签")), Materials: cell("素材说明"), Owner: cell("责任人"), Notes: cell("备注"), ProfileVisits: int64(parseInt(cell("主页访问"))), Follows: int64(parseInt(cell("新增关注"))), Attendance: int64(parseInt(cell("到场人数"))), Tickets: int64(parseInt(cell("售票数"))), CommentText: cell("评论摘录"), Source: "csv"}
-		if message := s.contentRuleFailure(r, c.TeamID, content.Title+"\n"+content.Notes, content.Tags, content.Category, content.WorkflowState); message != "" {
-			warnings = append(warnings, map[string]any{"row": line, "message": message})
-			continue
-		}
-		if _, saveErr := s.Store.CreateContent(r.Context(), c.TeamID, c.UserID, c.Name, content); saveErr != nil {
-			warnings = append(warnings, map[string]any{"row": line, "message": saveErr.Error()})
-			continue
-		}
-		imported++
-	}
-	writeJSON(w, 200, map[string]any{"imported": imported, "warnings": warnings})
-}
-
 func (s *Server) exportContentsCSV(w http.ResponseWriter, r *http.Request) {
 	items, err := s.Store.ListContents(r.Context(), claimsFrom(r).TeamID)
 	if err != nil {
@@ -600,30 +523,6 @@ func (s *Server) exportScheduleCSV(w http.ResponseWriter, r *http.Request) {
 
 func regexpUUID(value string) bool {
 	return len(value) == 36 && value[8] == '-' && value[13] == '-' && value[18] == '-' && value[23] == '-'
-}
-func parseInt(value string) int {
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
-		return 0
-	}
-	return parsed
-}
-func parseFloat(value string) float64 {
-	parsed, err := strconv.ParseFloat(value, 64)
-	if err != nil {
-		return 0
-	}
-	return parsed
-}
-func splitTags(value string) []string {
-	parts := strings.FieldsFunc(value, func(r rune) bool { return r == '|' || r == '，' || r == ',' })
-	result := []string{}
-	for _, part := range parts {
-		if strings.TrimSpace(part) != "" {
-			result = append(result, strings.TrimSpace(part))
-		}
-	}
-	return result
 }
 
 func (s *Server) teams(w http.ResponseWriter, r *http.Request) {

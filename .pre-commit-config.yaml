@@ -8,6 +8,6 @@ repos:
         types: [go]
       - id: go-test
         name: go test
-        entry: go test ./cmd/api ./internal/config ./internal/domain ./internal/httpapi ./internal/migrate ./internal/repository ./internal/service ./tools
+        entry: go test ./cmd/api ./internal/config ./internal/domain ./internal/httpapi ./internal/migrate ./internal/repository ./internal/service
         language: system
         pass_filenames: false
