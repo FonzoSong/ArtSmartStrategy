@@ -733,10 +733,10 @@ async function homePage(){
  const metricsMarkup=overview?`<div class="home-metrics">${metrics.map(item=>`<div class="home-metric"><div class="home-metric-label">${escapeHtml(item.label)}</div><div class="home-metric-value">${item.value}${item.unit?`<em> ${item.unit}</em>`:''}</div><div class="home-metric-foot">${escapeHtml(item.foot)}</div></div>`).join('')}</div>`:`<div class="empty-state error-state"><div class="empty-icon">!</div><h3>运营数据暂时无法读取</h3><p>首页仍可使用下方入口；请检查后端服务后重新加载统计指标。</p><button class="btn-primary" data-action="retry">重新加载</button></div>`;
  return `<section class="home-hero">
   <div class="home-hero-copy">
-   <div class="home-vertical">以数策传播 · 以数入艺</div>
+   <div class="home-vertical">以策传艺 · 以数入戏</div>
    <div class="home-hero-text">
     <div class="eyebrow">运营总览 · 卷首</div>
-    <h1 class="home-title">以数策传播<br>以数入艺</h1>
+    <h1 class="home-title">以策传艺<br>以数入戏</h1>
     <p class="home-lede">不追逐泛化的全网流量，而是分析团队自己的内容资产：从真实发布记录中沉淀可复用的传播经验，把每一场演出的预热做成可复盘的排期。</p>
     <div class="home-actions"><button class="btn-primary" data-action="home-generate-week">生成下周发布参考</button><button class="btn-secondary" data-goto="records">继续录入</button></div>
     <p class="home-footnote">数据仅来自本团队录入与回填：不外采平台内容，也不跨团队共享。</p>

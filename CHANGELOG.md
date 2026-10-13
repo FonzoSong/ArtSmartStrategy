@@ -88,6 +88,11 @@ Notable project changes are recorded here.
   missing, `.env` creation without overwriting, dev server on a free port, and a
   browser that opens only after the server is actually ready.
 - Rewrite `db/README.md` from the real schema and add `web/README.md`.
+- Home 首页口号改为「以策传艺 / 以数入戏」。
+- Add `db/sql/03_example_team_contents.sql`: an idempotent, team-scoped script that
+  tops a team up to 120 example content records (marked `source='example'`), so a
+  freshly created team can be inspected with realistic data volume without
+  touching existing rows, accounts, shows or plans.
 
 # v0.4.0
 

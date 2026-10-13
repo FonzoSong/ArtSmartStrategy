@@ -28,7 +28,8 @@ db/
 │   └── 02_seed_data.sh     # 初始化包装脚本：按 LOAD_EXAMPLE_DATA 决定是否导入样例
 ├── sql/                    # 手工运维脚本
 │   ├── create_database.sql # 手工建库（连接维护库执行）
-│   └── 02_seed_data.sql    # 可选虚构样例数据（幂等），标记 0002_seed_rules
+│   ├── 02_seed_data.sql    # 可选虚构样例数据（幂等），标记 0002_seed_rules
+│   └── 03_example_team_contents.sql # 可选：把指定团队补足到 120 条示例内容（幂等）
 └── README.md               # 本文件
 ```
 
@@ -38,6 +39,7 @@ db/
 | --- | --- | --- |
 | `db/init/01_schema.sql` | 仅新数据卷首次初始化 | 标准流程的一部分：建出与 Go 迁移等价的基线，并写入 `schema_migrations('0001_initial')`，让 API 继续应用后续迁移 |
 | `db/sql/02_seed_data.sql` | 仅新数据卷首次初始化且 `LOAD_EXAMPLE_DATA=true`；也可手工重跑 | 可选样例，不是生产数据；幂等，不会覆盖既有团队数据 |
+| `db/sql/03_example_team_contents.sql` | 手工执行，需传 `team_id` | 可选样例补充脚本：把指定团队补足到 120 条示例内容，用于新建团队后的界面/流程演示 |
 | `internal/migrate/sql/*.sql` | 每次 API 启动 | 唯一的标准升级路径；新增或变更结构一律追加迁移文件 |
 | `db/sql/create_database.sql` | 需要手工建库时 | 运维脚本；Docker 已自动建库时不要重复执行 |
 
@@ -453,6 +455,28 @@ psql -U arts_admin -d arts_smart -v ON_ERROR_STOP=1 -f db/sql/02_seed_data.sql
 
 最后一行是可选的样例数据导入。`02_seed_data.sql` 可重复执行（唯一键冲突忽略，内容样例仅在
 团队尚无内容时生成）。
+
+### 把某个团队补足到 120 条示例内容
+
+新环境首次初始化只给内置示例团队（team 1）填充示例内容。管理员在 Web 上新建自己的团队后，
+如果需要一批数据来查看列表、分页、筛选、效果分析和排期等页面的真实表现，用本脚本补足：
+
+```text
+docker compose cp db/sql/03_example_team_contents.sql db:/tmp/03_example_team_contents.sql
+docker compose exec -T db psql -U arts_admin -d arts_smart \
+  -v team_id=2 -v ON_ERROR_STOP=1 -f /tmp/03_example_team_contents.sql
+```
+
+特性与边界：
+
+- **幂等**：按“补足到 120 条”计算需要插入的行数，重复执行不会超过 120 条，也不会修改已有行。
+- **只增不改**：仅写入 `source='example'` 的示例内容与 5 个示例标签；不创建账号、演出或排期，
+  不删除任何数据。
+- **来源清晰**：标题带「示例第 N 条」、备注写明“示例数据（非真实运营记录）”，可与真实数据区分。
+- 该团队若已有正式演出，脚本会把新增示例内容分散关联到这些演出（不覆盖已有关联）；
+  没有演出时不建立关联。
+- 团队号可在 `SELECT id, name FROM team;` 中查看。示例内容的分组与效果指标是合成的，
+  只能用于界面与流程验证，不能当作运营结论。
 
 ## 8. 常见故障
 
