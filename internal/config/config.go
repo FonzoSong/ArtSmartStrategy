@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -66,6 +67,49 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// HealthcheckURL is the address the `healthcheck` subcommand probes. It follows
+// API_ADDR, so moving the API off :8080 cannot silently leave the container
+// healthcheck knocking on a port nothing listens on. HEALTHCHECK_URL overrides
+// it for topologies where the health endpoint is reachable only through another
+// host, port or scheme (a TLS terminator in front of the API, for example).
+func HealthcheckURL() string {
+	if override := strings.TrimSpace(os.Getenv("HEALTHCHECK_URL")); override != "" {
+		return override
+	}
+	return LocalHealthURL(envOr("API_ADDR", ":8080"))
+}
+
+// LocalHealthURL turns a listen address — ":8080", "0.0.0.0:9090",
+// "127.0.0.1:8080" or a bare port — into a probe URL. A wildcard or empty host
+// becomes the loopback host, because that is the only address guaranteed to
+// exist inside the container.
+func LocalHealthURL(address string) string {
+	host, port := splitHostPort(address)
+	if port == "" {
+		port = "8080"
+	}
+	host = strings.Trim(host, "[]")
+	switch host {
+	case "", "0.0.0.0", "::", "::0":
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/api/health/ready"
+}
+
+func splitHostPort(address string) (string, string) {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return "", ""
+	}
+	if host, port, err := net.SplitHostPort(address); err == nil {
+		return host, port
+	}
+	if _, err := strconv.Atoi(address); err == nil {
+		return "", address
+	}
+	return address, ""
 }
 
 func splitList(value string) []string {

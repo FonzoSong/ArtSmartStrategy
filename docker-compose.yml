@@ -34,6 +34,9 @@ services:
       dockerfile: Dockerfile
     environment:
       API_ADDR: ":8080"
+      # Optional override for the container healthcheck URL; empty means it is
+      # derived from API_ADDR (http://127.0.0.1:8080/api/health/ready).
+      HEALTHCHECK_URL: ${HEALTHCHECK_URL:-}
       TZ: ${TZ:-Asia/Shanghai}
       DATABASE_URL: postgresql://${APP_DB_USER:-arts_app}:${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env}@db:5432/${POSTGRES_DB:-arts_smart}?sslmode=disable
       APP_SECRET: ${APP_SECRET:?Set APP_SECRET in .env}
@@ -67,6 +70,10 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_API_BASE_URL: ""
+    environment:
+      # Address the web container proxies /api/ to. Defaults to the API service on
+      # this Compose network; override it to point the same image at another host.
+      API_UPSTREAM: ${API_UPSTREAM:-http://api:8080}
     depends_on:
       api:
         condition: service_healthy

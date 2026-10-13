@@ -1,0 +1,30 @@
+# Nginx configuration for the production web image.
+#
+# This file is a template: the official nginx entrypoint runs envsubst over it at
+# container start and writes the result to /etc/nginx/conf.d/default.conf, so the
+# API upstream is never baked into the image. Set API_UPSTREAM to the address the
+# web container should proxy /api/ to:
+#   - single-host Compose: http://api:8080 (the Dockerfile default)
+#   - split deployment:    http://10.10.0.20:8080, https://arts.example.com, ...
+# NGINX_ENVSUBST_FILTER limits substitution to API_UPSTREAM so nginx runtime
+# variables ($host, $uri, ...) are never touched.
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        proxy_pass ${API_UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 75s;
+    }
+}

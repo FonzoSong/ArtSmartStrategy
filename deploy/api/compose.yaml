@@ -6,6 +6,9 @@ services:
       dockerfile: Dockerfile
     environment:
       API_ADDR: ${API_ADDR:-:8080}
+      # Optional: override the container healthcheck URL when the health endpoint
+      # is not on the loopback host/port derived from API_ADDR.
+      HEALTHCHECK_URL: ${HEALTHCHECK_URL:-}
       TZ: ${TZ:-Asia/Shanghai}
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL}
       APP_SECRET: ${APP_SECRET:?Set APP_SECRET}

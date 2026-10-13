@@ -50,8 +50,8 @@ web/
 ├── tsconfig.json
 ├── .env / .env.example        # 前端环境变量（见第 4 节）
 ├── start.bat                  # Windows 非 Docker 一键启动脚本（见第 6 节）
-├── Dockerfile / nginx.conf    # 生产镜像：构建静态文件并由 Nginx 托管
-└── nginx.external.conf.template # 三服务器部署时的 Nginx 模板（API_UPSTREAM 可配）
+├── Dockerfile                 # 生产镜像：构建静态文件并由 Nginx 托管
+└── nginx.conf.template        # Nginx 模板：上游由 API_UPSTREAM 环境变量注入
 ```
 
 ## 3. 路由、页面与状态
@@ -224,6 +224,7 @@ curl http://localhost:5173/api/health/ready    # 经 Vite 代理访问后端（�
 | 浏览器报跨域错误，接口返回 `403 跨域来源未获允许` | 填写了完整的 `VITE_API_BASE_URL`，但后端未允许该来源（远端后端默认拒绝所有来源） | 把 `web/.env` 的 `VITE_API_BASE_URL` 留空，改用 `VITE_DEV_API_TARGET` 指向后端后重启 dev server；或在后端 `CORS_ALLOWED_ORIGINS` 登记前端来源 |
 | 启动窗口提示"后端 当前无法连接" | 本机网络/防火墙/VPN 无法到达 `VITE_DEV_API_TARGET` | 页面仍可使用，但接口会失败；确认后端已启动、地址与端口正确，能 `curl` 通后重新运行 `start.bat` |
 | **只读页面正常，但登录 / 创建团队管理员 / 保存时报 `403 跨域来源未获允许`** | 后端按 `Origin` 头做 CORS 白名单校验，而浏览器对写请求（POST/PATCH/DELETE）即使同源也会带 `Origin` | 开发服务器已默认剥掉该头（`vite.config.ts`），重启开发服务器即可；生产部署请把前端来源登记到后端 `CORS_ALLOWED_ORIGINS` |
+| 生产容器 `web` 起不来，日志报 `host not found in upstream` | `API_UPSTREAM` 指向的地址在该容器网络里解析不到 | 把 `API_UPSTREAM` 设为 web 容器可达的 API 地址（`docker compose` 同网络用 `http://api:8080`，跨服务器用 API 的私网地址），然后重启容器 |
 | 依赖安装失败 | 网络或缓存问题 | 删除 `node_modules` 后重新 `npm ci`；企业网络需配置 npm registry 代理 |
 | 修改 `.env` 没有效果 | Vite 只在启动时读取环境变量 | 重启 `npm run dev` |
 | 登录后立刻 401 | 会话已过期或被吊销 | 重新登录；确认后端 `APP_SECRET` 未更换 |
@@ -233,8 +234,15 @@ curl http://localhost:5173/api/health/ready    # 经 Vite 代理访问后端（�
 
 - `web/Dockerfile`：`node:22-alpine` 构建（`npm ci` → `typecheck` → `build`），再把 `dist/`
   交给 `nginx:1.27-alpine`；构建参数 `VITE_API_BASE_URL` 默认空串。
-- `web/nginx.conf`：`try_files` 支持 hash 路由刷新；`location /api/` 反代到 `api:8080`。
-- `web/nginx.external.conf.template`：三服务器部署模板，通过 `API_UPSTREAM` 指定 API 地址。
+- `web/nginx.conf.template`：进镜像后被放到 `/etc/nginx/templates/`，容器启动时由官方
+  entrypoint 用 `envsubst` 生成 `default.conf`。**API 地址不写死在配置或镜像里**，只由
+  `API_UPSTREAM` 环境变量决定：单机 Compose 用默认值 `http://api:8080`，三服务器部署填
+  API 的地址（如 `http://10.10.0.20:8080`）。`NGINX_ENVSUBST_FILTER=^API_UPSTREAM$` 保证
+  只替换这一个变量，nginx 自己的 `$host`、`$uri` 不受影响。
+- `try_files` 支持 hash 路由刷新；`location /api/` 反代到 `API_UPSTREAM`。
+- **部署 web 容器后必须让后端 `CORS_ALLOWED_ORIGINS` 包含用户实际访问的来源**（例如
+  `http://59.110.90.28`）：nginx 会把浏览器的 `Origin` 原样转发给 API，写请求（登录、
+  保存）在来源未登记时会返回 403。
 - 生产环境不暴露源码，`dist/` 内含哈希文件名的 JS/CSS；静态资源（如首页插画）位于
   `web/public/`，构建后可通过 `/art-home-ink-ridge.svg` 访问。
 

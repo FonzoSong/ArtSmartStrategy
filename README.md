@@ -59,9 +59,11 @@ docker compose --env-file deploy/web/.env -f deploy/web/compose.yaml up --build 
 ```
 
 前端服务器需将 `WEB_BIND_ADDRESS` 设为可供用户或 TLS 反向代理访问的接口地址；本机测试
-设为 `127.0.0.1`。API 服务器 `CORS_ALLOWED_ORIGINS` 填写 Web 的完整来源。数据库和 API
-之间应使用私有网络或 VPN，并按示例限制防火墙来源；跨不可信网络部署需配置 PostgreSQL TLS
-并在 `DATABASE_URL` 使用 `sslmode=require`。
+设为 `127.0.0.1`。Web 服务器用 `API_UPSTREAM` 指定 API 地址（单机 Compose 默认
+`http://api:8080`，三服务器部署填 API 的私网地址），该值在容器启动时注入 Nginx。API 服务器
+`CORS_ALLOWED_ORIGINS` 填写 Web 的完整来源，否则浏览器发起的写请求（登录、保存）会返回
+`403 跨域来源未获允许`。数据库和 API 之间应使用私有网络或 VPN，并按示例限制防火墙来源；
+跨不可信网络部署需配置 PostgreSQL TLS 并在 `DATABASE_URL` 使用 `sslmode=require`。
 
 ## 本机开发
 

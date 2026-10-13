@@ -6,8 +6,6 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_API_BASE_URL: ""
-        NGINX_CONFIG: nginx.external.conf.template
-        NGINX_CONFIG_DEST: /etc/nginx/templates/default.conf.template
     environment:
       API_UPSTREAM: ${API_UPSTREAM:?Set API_UPSTREAM to the API private URL}
       NGINX_ENVSUBST_FILTER: ^API_UPSTREAM$

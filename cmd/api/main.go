@@ -24,7 +24,7 @@ func main() {
 	slog.SetDefault(logger)
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		client := http.Client{Timeout: 3 * time.Second}
-		response, err := client.Get("http://127.0.0.1:8080/api/health/ready")
+		response, err := client.Get(config.HealthcheckURL())
 		if err != nil || response.StatusCode != http.StatusOK {
 			os.Exit(1)
 		}

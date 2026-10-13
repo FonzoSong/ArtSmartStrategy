@@ -111,6 +111,13 @@ Notable project changes are recorded here.
   administrator and saving records failed while reads kept working. The Vite proxy
   now removes that header before forwarding, since the browser only talks to the
   dev server. Deployed origins still belong in the API's `CORS_ALLOWED_ORIGINS`.
+- Remove the remaining hardcoded service addresses. The container healthcheck no
+  longer probes a literal `http://127.0.0.1:8080`: it follows `API_ADDR` and can be
+  overridden with `HEALTHCHECK_URL`, so an API moved off the default port no longer
+  reports unhealthy. The production Nginx upstream comes from `API_UPSTREAM` at
+  container start instead of a baked-in `api:8080` (`web/nginx.conf.template`),
+  which replaces both the previous `nginx.conf` and the separate
+  `nginx.external.conf.template`.
 
 # v0.4.0
 
