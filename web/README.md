@@ -122,6 +122,13 @@ web/
   请求一律返回 `403 跨域来源未获允许`（`origin_forbidden`），`http://localhost:5173` 也不例外。
   所以指向该后端时必须留空 `VITE_API_BASE_URL`，由开发服务器（或生产 Nginx）代理 `/api`；
   后端地址只写在 `VITE_DEV_API_TARGET`。
+- **开发服务器会剥离 `Origin` 头**（`vite.config.ts` 的 `configure` → `proxyReq.removeHeader`）：
+  浏览器对 POST/PATCH/DELETE **即使同源也会带 `Origin`**，原样转发就会被后端 CORS 中间件
+  拦下——表现为「页面能打开、只读页面正常，但登录、创建团队管理员、保存内容时报
+  403 跨域来源未获允许」。浏览器与开发服务器之间不是跨域请求，代理转发时去掉该头即可，
+  不需要改后端。改完 `vite.config.ts` 必须重启开发服务器。
+- 若要在生产环境跨来源直连后端（或由 Nginx 代理且浏览器来源不是后端白名单里的那个），
+  正确做法是在后端 `CORS_ALLOWED_ORIGINS` 登记前端来源，而不是靠代理剥离请求头。
 
 ### 本地运行与 Docker 的差异
 
@@ -216,6 +223,7 @@ curl http://localhost:5173/api/health/ready    # 经 Vite 代理访问后端（�
 | 开发时 `/api/...` 返回 500 | Vite 代理目标不可达（默认 `http://localhost:8080`，但后端只在容器里） | 在 `web/.env` 设 `VITE_DEV_API_TARGET=http://localhost`（或后端实际地址）后重启 dev server |
 | 浏览器报跨域错误，接口返回 `403 跨域来源未获允许` | 填写了完整的 `VITE_API_BASE_URL`，但后端未允许该来源（远端后端默认拒绝所有来源） | 把 `web/.env` 的 `VITE_API_BASE_URL` 留空，改用 `VITE_DEV_API_TARGET` 指向后端后重启 dev server；或在后端 `CORS_ALLOWED_ORIGINS` 登记前端来源 |
 | 启动窗口提示"后端 当前无法连接" | 本机网络/防火墙/VPN 无法到达 `VITE_DEV_API_TARGET` | 页面仍可使用，但接口会失败；确认后端已启动、地址与端口正确，能 `curl` 通后重新运行 `start.bat` |
+| **只读页面正常，但登录 / 创建团队管理员 / 保存时报 `403 跨域来源未获允许`** | 后端按 `Origin` 头做 CORS 白名单校验，而浏览器对写请求（POST/PATCH/DELETE）即使同源也会带 `Origin` | 开发服务器已默认剥掉该头（`vite.config.ts`），重启开发服务器即可；生产部署请把前端来源登记到后端 `CORS_ALLOWED_ORIGINS` |
 | 依赖安装失败 | 网络或缓存问题 | 删除 `node_modules` 后重新 `npm ci`；企业网络需配置 npm registry 代理 |
 | 修改 `.env` 没有效果 | Vite 只在启动时读取环境变量 | 重启 `npm run dev` |
 | 登录后立刻 401 | 会话已过期或被吊销 | 重新登录；确认后端 `APP_SECRET` 未更换 |

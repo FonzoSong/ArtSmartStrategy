@@ -46,6 +46,19 @@ export default defineConfig(({ mode }) => {
           // The backend itself gives up after REQUEST_TIMEOUT (15s), so a little
           // headroom here keeps a silent network drop from hanging the page.
           proxyTimeout: 20000,
+          // The API answers `403 跨域来源未获允许` whenever a request carries an
+          // `Origin` that is not listed in the server's CORS_ALLOWED_ORIGINS.
+          // Browsers send `Origin` on POST/PATCH/DELETE even for same-origin
+          // calls, so forwarding it would make every write fail (logging in,
+          // creating the team administrator, saving records) while reads keep
+          // working — the exact "only some buttons fail" symptom. The browser
+          // only ever talks to the dev server, so this request is not
+          // cross-origin: drop the header and let the proxy act as the client.
+          configure: (proxy) => {
+            proxy.on("proxyReq", (proxyReq) => {
+              proxyReq.removeHeader("origin");
+            });
+          },
         },
       },
     },

@@ -105,6 +105,12 @@ Notable project changes are recorded here.
   and needs neither Docker nor a local backend. The previous Docker Compose
   launcher moved to `start-docker.bat` unchanged, and the README, CONTRIBUTING and
   refactor-plan references were updated.
+- Fix writes failing with `403 跨域来源未获允许` behind the dev server: browsers send
+  `Origin` on POST/PATCH/DELETE even for same-origin calls, and the API rejects any
+  `Origin` outside `CORS_ALLOWED_ORIGINS`, so logging in, creating the team
+  administrator and saving records failed while reads kept working. The Vite proxy
+  now removes that header before forwarding, since the browser only talks to the
+  dev server. Deployed origins still belong in the API's `CORS_ALLOWED_ORIGINS`.
 
 # v0.4.0
 
