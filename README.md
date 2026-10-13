@@ -10,7 +10,9 @@ Docker Compose PostgreSQL。浏览器仅通过同源 `/api` 访问后端；数�
 - `internal/httpapi`：REST API、认证、权限、CORS 和统一错误响应。
 - `internal/repository`：PostgreSQL 查询、团队隔离和事务。
 - `internal/migrate/sql`：版本化 PostgreSQL schema 迁移。
-- `web`：独立 Vite/TypeScript 应用；生产由 Nginx 代理 `/api/`。
+- `web`：独立 Vite/TypeScript 应用；生产由 Nginx 代理 `/api/`。页面包含首页、运营总览、
+  内容记录、正式演出（预热视频聚合与整场排期）、效果分析、排期建议与排期日历、模型设置、
+  团队管理、内容规则集与 Tag 库；开发说明见 [web/README.md](web/README.md)。
 - `db/init`、`db/sql`：首次建库 schema 和独立的可选示例 SQL。
 
 业务数据持久化在 PostgreSQL named volume `arts-smart-postgres-data`。服务不能连接数据库
@@ -20,7 +22,8 @@ Docker Compose PostgreSQL。浏览器仅通过同源 `/api` 访问后端；数�
 
 安装 Docker Desktop（含 Compose v2），将 `.env.example` 复制为 `.env`，配置
 `POSTGRES_ADMIN_PASSWORD`、`APP_DB_PASSWORD` 和至少 32 字符的 `APP_SECRET`。可选配置
-`AI_API_KEY`；密钥只从后端环境注入，不会回显给浏览器。
+`AI_API_KEY`；密钥只从后端环境注入，不会回显给浏览器。`TZ`（默认 `Asia/Shanghai`）决定
+正式演出的“已开演”判定与日期渲染，团队不在东八区时请一并调整。
 
 ```text
 docker compose config -q
@@ -77,6 +80,11 @@ cd web
 npm ci
 npm run dev
 ```
+
+Windows 也可直接双击 [web/start.bat](web/start.bat)：它会检查 Node/npm 与依赖、在缺失时
+安装、启动开发服务器、等待服务真正就绪后打开浏览器，并在失败时给出明确原因。若后端不是
+本机 8080（例如只在 Compose 中运行），先把 `web/.env` 的 `VITE_DEV_API_TARGET` 指向本机可达
+的地址（例如 `http://localhost`）。前端环境变量说明见 [web/README.md](web/README.md)。
 
 ## 数据库维护
 

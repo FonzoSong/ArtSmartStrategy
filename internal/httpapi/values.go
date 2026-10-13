@@ -141,6 +141,26 @@ func timestampField(row map[string]any, key string) string {
 	}
 }
 
+// timeField reads a timestamp column as time.Time, reporting false when the
+// column is missing or not a timestamp.
+func timeField(row map[string]any, key string) (time.Time, bool) {
+	value, ok := row[key]
+	if !ok || value == nil {
+		return time.Time{}, false
+	}
+	switch typed := value.(type) {
+	case time.Time:
+		return typed, true
+	case string:
+		for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"} {
+			if parsed, err := time.Parse(layout, typed); err == nil {
+				return parsed, true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
 // roundTo rounds a value to the given number of decimal places.
 func roundTo(value float64, decimals int) float64 {
 	if math.IsNaN(value) || math.IsInf(value, 0) {

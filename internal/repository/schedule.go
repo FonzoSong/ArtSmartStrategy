@@ -301,7 +301,9 @@ func scheduleRecord(ctx context.Context, tx *sql.Tx, teamID, actorID int64, requ
 
 // UpdateSchedule changes only the allow-listed date and display fields.
 func (r *Postgres) UpdateSchedule(ctx context.Context, teamID int64, id string, fields map[string]any) (map[string]any, error) {
-	allowed := map[string]bool{"planned_date": true, "planned_time": true, "title": true, "category": true, "platform": true, "owner": true}
+	// `source` and `reason` are part of the manual-adjustment record: an edited
+	// plan is marked as user-adjusted and may carry the human rationale.
+	allowed := map[string]bool{"planned_date": true, "planned_time": true, "title": true, "category": true, "platform": true, "owner": true, "source": true, "reason": true}
 	args := []any{}
 	assignments := []string{}
 	for key, value := range fields {

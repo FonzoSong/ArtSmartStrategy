@@ -38,6 +38,56 @@ Notable project changes are recorded here.
   → 未发布 → 已发布.
 - Reload the suggestion list from the server after generate, remove, adopt and
   reschedule operations instead of mutating the client copy.
+- Fix performance booking: `POST /api/performances` now accepts the browser's
+  `datetime-local` start time (it previously rejected every submission as invalid
+  JSON), and the booking list returns real linked-content counters.
+- Add 正式演出 management on the existing `performance_booking` entity: detail,
+  update and delete endpoints, `performance_type` / `ticket_link` fields, and the
+  canonical 筹备中 / 预热中 / 已演出 / 已取消 status set (migration
+  `0008_performance_management`). A show whose start time has passed is settled to
+  已演出 server-side; 已取消 is terminal and is never rewritten.
+- Add the 正式演出 page: show list with 距开演天数 and persisted 预热视频/排期 counts,
+  a detail view that aggregates published assets with their real effect data, the
+  unpublished asset list, the pre-heat timeline, and a copy of the link/unlink
+  and create-video actions.
+- Add whole-show scheduling (`POST /api/performances/{id}/plan`): plans only the
+  show's unpublished 待排期 videos, never past the curtain, spread across days and
+  platforms, with reasons that cite the team's own history and that state
+  "样本不足" when the history is missing. Plans are stored as normal
+  recommendations and adopted through the existing `POST /api/schedule/adopt`, so
+  there is no second scheduling model.
+- Record manual plan changes: an edited plan is marked `source=manual`, keeps its
+  before/after values in the audit log, and can be reviewed in the UI
+  (`GET /api/schedule/{id}/adjustments`).
+- Add the 演出 dimension to the operations overview (筹备中演出数、最近一场距开演天数、
+  未发布预热视频数、整场排期完成率), a per-show comparison on the analysis page, and a
+  演出 filter on both the suggestion page and the calendar.
+- Add an independent Home page (`#home`) as the product front page: brand
+  navigation, editorial layout, two real entry points, and four indicators that
+  come from existing statistics APIs. The page ships a locally maintained
+  cyan-green ink-wash SVG (`web/public/art-home-ink-ridge.svg`).
+- Fix the API client so `204 No Content` responses no longer surface as failures:
+  deleting content, a tag, a rule set, a rule or a schedule item now reports
+  success, and the lists refresh.
+- Fix deleting a scheduled content record: the record's plans are removed in the
+  same transaction (previously a foreign-key violation returned HTTP 500).
+- Fix the planning-window boundary in a non-UTC deployment: the last day of the
+  horizon is no longer generated and then rejected at adoption, because the date
+  is now compared in the window's own timezone.
+- Make the rule-set endpoints unambiguous: custom and system rule sets have
+  independent id sequences, so mutations accept an explicit `kind` and refuse
+  `kind=system` outright. The API client sends `kind=custom` for custom sets.
+- Align the deployment timezone (`TZ`, default `Asia/Shanghai`) across the API and
+  database, and compare show start times against the application clock, so the
+  automatic 已演出 transition follows the team's wall clock.
+- Configure the frontend backend address in one place: `VITE_API_BASE_URL` (empty
+  means same-origin `/api`) plus `VITE_DEV_API_TARGET` for the development proxy.
+  `web/.env` no longer ships a Docker-internal service name, and the client
+  normalizes a bare host into a real URL.
+- Add Windows `web/start.bat`: environment checks, dependency install only when
+  missing, `.env` creation without overwriting, dev server on a free port, and a
+  browser that opens only after the server is actually ready.
+- Rewrite `db/README.md` from the real schema and add `web/README.md`.
 
 # v0.4.0
 

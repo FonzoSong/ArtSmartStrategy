@@ -263,6 +263,57 @@ func (r *Postgres) UpdateContent(
 }
 
 // DeleteContent removes a team-owned content record and linked workflow rows.
+// ContentCategoryCounts returns one count per content records category, using the
+// same semantics as the category filter: workflow state for the pipeline stages
+// and lifecycle for the derived 未发布/已发布 views. The aggregation happens in the
+// database, so the numbers never depend on the current page.
+func (r *Postgres) ContentCategoryCounts(ctx context.Context, teamID int64) (map[string]int64, error) {
+	rows, err := r.QueryMaps(ctx, `
+		SELECT
+			COUNT(*) FILTER (WHERE workflow_state = '待制作') AS drafting,
+			COUNT(*) FILTER (WHERE workflow_state = '已制作') AS produced,
+			COUNT(*) FILTER (WHERE workflow_state = '待排期') AS scheduling,
+			COUNT(*) FILTER (WHERE workflow_state = '已排期') AS scheduled,
+			COUNT(*) FILTER (WHERE lifecycle = '未发布') AS unpublished,
+			COUNT(*) FILTER (WHERE lifecycle = '已发布') AS published,
+			COUNT(*) AS total
+		FROM content WHERE team_id = $1
+	`, teamID)
+	if err != nil {
+		return nil, err
+	}
+	counts := map[string]int64{}
+	for _, category := range domain.CategoryOrder() {
+		counts[string(category)] = 0
+	}
+	if len(rows) == 0 {
+		return counts, nil
+	}
+	row := rows[0]
+	counts[string(domain.CategoryDrafting)] = intColumn(row, "drafting")
+	counts[string(domain.CategoryProduced)] = intColumn(row, "produced")
+	counts[string(domain.CategoryScheduling)] = intColumn(row, "scheduling")
+	counts[string(domain.CategoryScheduled)] = intColumn(row, "scheduled")
+	counts[string(domain.CategoryUnpublished)] = intColumn(row, "unpublished")
+	counts[string(domain.CategoryPublished)] = intColumn(row, "published")
+	counts[string(domain.CategoryAll)] = intColumn(row, "total")
+	return counts, nil
+}
+
+// intColumn reads a non-null integer column produced by QueryMaps.
+func intColumn(row map[string]any, key string) int64 {
+	switch typed := row[key].(type) {
+	case int64:
+		return typed
+	case int32:
+		return int64(typed)
+	case int:
+		return int64(typed)
+	default:
+		return 0
+	}
+}
+
 func (r *Postgres) DeleteContent(
 	ctx context.Context,
 	teamID int64,
@@ -274,6 +325,17 @@ func (r *Postgres) DeleteContent(
 		return err
 	}
 	defer tx.Rollback()
+	// A content record owns its publishing plans: delete them first so the
+	// schedule foreign key does not block the deletion, and report how many were
+	// removed together with the record.
+	plans, err := tx.ExecContext(ctx, `DELETE FROM schedule WHERE team_id = $1 AND content_id = $2`, teamID, contentID)
+	if err != nil {
+		return err
+	}
+	removedPlans, err := plans.RowsAffected()
+	if err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `
 		DELETE FROM content WHERE id = $1 AND team_id = $2
 	`, contentID, teamID)
@@ -287,7 +349,8 @@ func (r *Postgres) DeleteContent(
 	if count == 0 {
 		return sql.ErrNoRows
 	}
-	if err = insertAudit(ctx, tx, teamID, actor, "delete", "content", contentID, "内容记录已删除"); err != nil {
+	if err = insertAudit(ctx, tx, teamID, actor, "delete", "content", contentID,
+		fmt.Sprintf("内容记录已删除；同时移除 %d 条关联排期", removedPlans)); err != nil {
 		return err
 	}
 	return tx.Commit()

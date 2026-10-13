@@ -72,6 +72,41 @@ func TestPlanningWindowContainsIsInclusiveOnBothEdges(t *testing.T) {
 	}
 }
 
+// TestPlanningWindowWindowBoundariesInANonUTCTimezone pins the deployment bug:
+// with a non-UTC team timezone the last day of the horizon used to be generated
+// by the planner and then rejected at adoption, because the date was parsed as
+// UTC while the window lived in the team's zone.
+func TestPlanningWindowBoundariesInANonUTCTimezone(t *testing.T) {
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Skipf("timezone database unavailable: %v", err)
+	}
+	window, ok := HorizonWindow(time.Date(2026, 10, 13, 14, 0, 0, 0, shanghai), 14)
+	if !ok {
+		t.Fatal("expected a valid window")
+	}
+	if got := window.End.Format("2006-01-02"); got != "2026-10-26" {
+		t.Fatalf("end = %s, want 2026-10-26", got)
+	}
+	for _, date := range []string{"2026-10-13", "2026-10-26"} {
+		if !window.Contains(date) {
+			t.Fatalf("Contains(%q) must be true inside a %s window", date, shanghai)
+		}
+	}
+	for _, date := range []string{"2026-10-12", "2026-10-27"} {
+		if window.Contains(date) {
+			t.Fatalf("Contains(%q) must be false outside the window", date)
+		}
+	}
+	rules := PlanningRules{TimeWindows: []string{"19:30"}}
+	if err := rules.ValidateSlot(window, "2026-10-26", "19:30", SlotCounts{SameDay: 1}); err != nil {
+		t.Fatalf("the last horizon day must be adoptable: %v", err)
+	}
+	if err := rules.ValidateSlot(window, "2026-10-27", "19:30", SlotCounts{SameDay: 1}); err != ErrSlotWindow {
+		t.Fatalf("the day after the horizon must be rejected, got %v", err)
+	}
+}
+
 func TestValidateSlotRejectsOutOfRangeAndRuleViolations(t *testing.T) {
 	window, ok := HorizonWindow(time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC), 14)
 	if !ok {

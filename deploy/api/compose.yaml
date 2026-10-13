@@ -6,6 +6,7 @@ services:
       dockerfile: Dockerfile
     environment:
       API_ADDR: ${API_ADDR:-:8080}
+      TZ: ${TZ:-Asia/Shanghai}
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL}
       APP_SECRET: ${APP_SECRET:?Set APP_SECRET}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?Set CORS_ALLOWED_ORIGINS to the frontend origin}

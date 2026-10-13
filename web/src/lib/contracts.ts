@@ -51,6 +51,7 @@ export interface OverviewTopContent {
 export interface OverviewMetrics {
   published_count: number;
   unpublished_count: number;
+  total_content_count: number;
   total_posts: number;
   total_views: number;
   total_likes: number;
@@ -60,6 +61,43 @@ export interface OverviewMetrics {
   sample_count: number;
   top_contents: OverviewTopContent[];
   weights: { completion: number; interaction: number };
+  performances: OverviewPerformances;
+}
+
+/**
+ * The 正式演出 statistics shown on the operations overview and the home page.
+ * They come from persisted shows, content links and plans, so a value is only
+ * absent (`null`) when the underlying data does not exist yet.
+ */
+export interface OverviewPerformances {
+  preparing_count: number;
+  warming_up_count: number;
+  played_count: number;
+  canceled_count: number;
+  linked_performance_count: number;
+  unpublished_promo_count: number;
+  planned_count: number;
+  plan_total: number;
+  schedule_completion_rate: number | null;
+  next_starts_at: string;
+  next_days_to_start: number | null;
+}
+
+function normalizeOverviewPerformances(value: unknown): OverviewPerformances {
+  const source = isRecord(value) ? value : {};
+  return {
+    preparing_count: asNumber(source.preparing_count),
+    warming_up_count: asNumber(source.warming_up_count),
+    played_count: asNumber(source.played_count),
+    canceled_count: asNumber(source.canceled_count),
+    linked_performance_count: asNumber(source.linked_performance_count),
+    unpublished_promo_count: asNumber(source.unpublished_promo_count),
+    planned_count: asNumber(source.planned_count),
+    plan_total: asNumber(source.plan_total),
+    schedule_completion_rate: asNullableNumber(source.schedule_completion_rate),
+    next_starts_at: asString(source.next_starts_at),
+    next_days_to_start: asNullableNumber(source.next_days_to_start),
+  };
 }
 
 /** Normalizes the operations overview payload into always-present fields. */
@@ -70,6 +108,7 @@ export function normalizeOverview(payload: unknown): OverviewMetrics {
   return {
     published_count: published,
     unpublished_count: asNumber(source.unpublished_count),
+    total_content_count: asNumber(source.total_content_count, published),
     total_posts: asNumber(source.total_posts, published),
     total_views: asNumber(source.total_views),
     total_likes: asNumber(source.total_likes),
@@ -91,7 +130,150 @@ export function normalizeOverview(payload: unknown): OverviewMetrics {
       completion: asNumber(weights.completion, 0.6),
       interaction: asNumber(weights.interaction, 0.4),
     },
+    performances: normalizeOverviewPerformances(source.performances),
   };
+}
+
+export interface PerformanceRow {
+  id: string;
+  title: string;
+  venue: string;
+  starts_at: string;
+  booking_status: string;
+  performance_type: string;
+  ticket_link: string;
+  owner: string;
+  owner_user_id: number | null;
+  notes: string;
+  content_count: number;
+  published_content_count: number;
+  unpublished_content_count: number;
+  schedulable_content_count: number;
+  scheduled_content_count: number;
+}
+
+/** Normalizes one 正式演出 row, keeping counters numeric and dates as text. */
+export function normalizePerformance(payload: unknown): PerformanceRow {
+  const row = isRecord(payload) ? payload : {};
+  const ownerID = asNullableNumber(row.owner_user_id);
+  return {
+    id: asString(row.id),
+    title: asString(row.title),
+    venue: asString(row.venue),
+    starts_at: asString(row.starts_at),
+    booking_status: asString(row.booking_status),
+    performance_type: asString(row.performance_type),
+    ticket_link: asString(row.ticket_link),
+    owner: asString(row.owner) || asString(row.owner_name),
+    owner_user_id: ownerID,
+    notes: asString(row.notes),
+    content_count: asNumber(row.content_count),
+    published_content_count: asNumber(row.published_content_count),
+    unpublished_content_count: asNumber(row.unpublished_content_count),
+    schedulable_content_count: asNumber(row.schedulable_content_count),
+    scheduled_content_count: asNumber(row.scheduled_content_count),
+  };
+}
+
+/** Normalizes the 正式演出 list. */
+export function normalizePerformanceList(payload: unknown): PerformanceRow[] {
+  return asRecords(payload).map(normalizePerformance);
+}
+
+export interface PerformanceDetail {
+  performance: PerformanceRow;
+  days_to_start: number | null;
+  published: Record<string, unknown>[];
+  unpublished: Record<string, unknown>[];
+  timeline: ScheduleRow[];
+  counts: Record<string, number>;
+  status_options: string[];
+}
+
+/** Normalizes one 正式演出 detail payload with its aggregated content. */
+export function normalizePerformanceDetail(payload: unknown): PerformanceDetail {
+  const source = isRecord(payload) ? payload : {};
+  const counts = isRecord(source.counts) ? source.counts : {};
+  const normalizedCounts: Record<string, number> = {};
+  for (const [key, value] of Object.entries(counts)) {
+    normalizedCounts[key] = asNumber(value);
+  }
+  return {
+    performance: normalizePerformance(source.performance),
+    days_to_start: asNullableNumber(source.days_to_start),
+    published: asRecords(source.published).map((row) => ({ ...row, published_at: asString(row.published_at) })),
+    unpublished: asRecords(source.unpublished).map((row) => ({ ...row, planned_date: pureDateKey(row.planned_date) })),
+    timeline: asRecords(source.timeline).map(normalizeScheduleRow),
+    counts: normalizedCounts,
+    status_options: Array.isArray(source.status_options) ? source.status_options.map(asString).filter(Boolean) : [],
+  };
+}
+
+export interface PerformanceComparisonRow {
+  id: string;
+  title: string;
+  venue: string;
+  booking_status: string;
+  performance_type: string;
+  starts_at: string;
+  published_count: number;
+  unpublished_count: number;
+  total_views: number;
+  total_interactions: number;
+  avg_completion: number | null;
+  interaction_rate: number | null;
+  sample_sufficient: boolean;
+}
+
+export interface PerformanceComparison {
+  items: PerformanceComparisonRow[];
+  min_sample: number;
+  baseline: { sample_count: number; avg_completion: number | null; interaction_rate: number | null };
+}
+
+/** Normalizes the per-show comparison used by the analysis page. */
+export function normalizePerformanceComparison(payload: unknown): PerformanceComparison {
+  const source = isRecord(payload) ? payload : {};
+  const baseline = isRecord(source.baseline) ? source.baseline : {};
+  return {
+    items: asRecords(source.items).map((row) => ({
+      id: asString(row.id),
+      title: asString(row.title),
+      venue: asString(row.venue),
+      booking_status: asString(row.booking_status),
+      performance_type: asString(row.performance_type),
+      starts_at: asString(row.starts_at),
+      published_count: asNumber(row.published_count),
+      unpublished_count: asNumber(row.unpublished_count),
+      total_views: asNumber(row.total_views),
+      total_interactions: asNumber(row.total_interactions),
+      avg_completion: asNullableNumber(row.avg_completion),
+      interaction_rate: asNullableNumber(row.interaction_rate),
+      sample_sufficient: row.sample_sufficient === true,
+    })),
+    min_sample: asNumber(source.min_sample, 3),
+    baseline: {
+      sample_count: asNumber(baseline.sample_count),
+      avg_completion: asNullableNumber(baseline.avg_completion),
+      interaction_rate: asNullableNumber(baseline.interaction_rate),
+    },
+  };
+}
+
+export interface ScheduleAdjustment {
+  actor: string;
+  detail: string;
+  created_at: string;
+}
+
+/** Normalizes recorded manual schedule changes. */
+export function normalizeScheduleAdjustments(payload: unknown): ScheduleAdjustment[] {
+  const source = isRecord(payload) ? payload : {};
+  return asRecords(source.items).map((row) => ({
+    actor: asString(row.actor),
+    detail: asString(row.detail),
+    created_at: asString(row.created_at),
+  }));
 }
 
 export interface ScheduleRow {
@@ -250,7 +432,7 @@ export interface ContentRecordExtra {
  * Normalizes content rows. `published_at` always becomes a string so display
  * code can slice it safely, and counters always become numbers.
  */
-export function normalizeContentList(payload: unknown): { items: ContentRecordExtra[] } {
+export function normalizeContentList(payload: unknown): { items: ContentRecordExtra[]; counts: Record<string, number> } {
   const source = isRecord(payload) ? payload : {};
   const items = asRecords(source.items).map((row) => ({
     ...row,
@@ -261,7 +443,15 @@ export function normalizeContentList(payload: unknown): { items: ContentRecordEx
     total_interactions: asNumber(row.total_interactions),
     tags: Array.isArray(row.tags) ? row.tags.map(asString) : [],
   }));
-  return { items };
+  // Category counts are aggregated by the server; the client only mirrors them so
+  // the badges never depend on the current page. A missing map stays empty and the
+  // page falls back to counting the loaded records.
+  const rawCounts = isRecord(source.counts) ? source.counts : {};
+  const counts: Record<string, number> = {};
+  for (const [key, value] of Object.entries(rawCounts)) {
+    counts[key] = asNumber(value);
+  }
+  return { items, counts };
 }
 
 export interface TeamRule {
@@ -458,6 +648,10 @@ export function normalizeAPIResponse(path: string, payload: unknown): unknown {
       return normalizeRuleLogs(payload);
     case "/api/rules/system":
       return normalizeSystemRuleSets(payload);
+    case "/api/performances":
+      return normalizePerformanceList(payload);
+    case "/api/stats/performances":
+      return normalizePerformanceComparison(payload);
     case "/api/recommendations":
       return normalizeSuggestionHistory(payload);
     case "/api/ai/recommend":
@@ -467,6 +661,12 @@ export function normalizeAPIResponse(path: string, payload: unknown): unknown {
   }
   if (/^\/api\/schedule\/[^/]+$/.test(pathname)) {
     return normalizeScheduleRow(payload);
+  }
+  if (/^\/api\/schedule\/[^/]+\/adjustments$/.test(pathname)) {
+    return normalizeScheduleAdjustments(payload);
+  }
+  if (/^\/api\/performances\/[^/]+$/.test(pathname)) {
+    return normalizePerformanceDetail(payload);
   }
   if (/^\/api\/recommendations\/[^/]+$/.test(pathname)) {
     return normalizeSuggestionPayload(payload);

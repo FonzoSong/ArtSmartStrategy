@@ -81,7 +81,10 @@ func (w PlanningWindow) Days() int {
 // Contains reports whether a YYYY-MM-DD date falls inside the window. The value
 // is compared as a pure calendar date, without any timezone conversion.
 func (w PlanningWindow) Contains(date string) bool {
-	parsed, err := time.Parse("2006-01-02", date)
+	// The date must be read in the window's own timezone. Parsing it as UTC would
+	// shift the last day of a non-UTC horizon past End, so a plan that generation
+	// legitimately produced would be rejected at adoption.
+	parsed, err := time.ParseInLocation("2006-01-02", date, w.Start.Location())
 	if err != nil || !w.Valid() {
 		return false
 	}
@@ -99,7 +102,7 @@ type SlotCounts struct {
 // lists mean every weekday is allowed; empty time windows mean the rule set
 // cannot schedule anything.
 func (p PlanningRules) ValidateSlot(window PlanningWindow, date, clock string, counts SlotCounts) error {
-	planned, err := time.Parse("2006-01-02", date)
+	planned, err := time.ParseInLocation("2006-01-02", date, window.Start.Location())
 	if err != nil {
 		return ErrSlotDateInvalid
 	}

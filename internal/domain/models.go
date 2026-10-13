@@ -16,7 +16,30 @@ const (
 	WorkflowSchedulePending   = "待排期"
 	WorkflowScheduled         = "已排期"
 	WorkflowPublished         = "已发布"
+
+	// PerformanceStatus* are the canonical 正式演出 states. The 演出时间 expiry
+	// rule (a show whose start time has passed becomes 已演出) is enforced by the
+	// service layer; 已取消 is terminal and is never rewritten automatically.
+	PerformancePreparing = "筹备中"
+	PerformanceWarmingUp = "预热中"
+	PerformancePlayed    = "已演出"
+	PerformanceCanceled  = "已取消"
 )
+
+// PerformanceStatuses lists the canonical 正式演出 states in display order.
+func PerformanceStatuses() []string {
+	return []string{PerformancePreparing, PerformanceWarmingUp, PerformancePlayed, PerformanceCanceled}
+}
+
+// IsPerformanceStatus reports whether value is a canonical 正式演出 state.
+func IsPerformanceStatus(value string) bool {
+	for _, status := range PerformanceStatuses() {
+		if status == value {
+			return true
+		}
+	}
+	return false
+}
 
 // Team is an isolated organization workspace.
 type Team struct {
@@ -75,18 +98,23 @@ type Content struct {
 	EngagementRate    float64   `json:"engagement_rate"`
 }
 
-// Performance is a booked performance linked to promotional content.
+// Performance is one 正式演出: the booking record that owns the promotional
+// videos of a single show. Promotional content links to it through
+// content.performance_id, so a show is the grouping container rather than a
+// parallel content model.
 type Performance struct {
-	ID            string    `json:"id"`
-	TeamID        int64     `json:"team_id"`
-	Title         string    `json:"title"`
-	Venue         string    `json:"venue"`
-	StartsAt      time.Time `json:"starts_at"`
-	BookingStatus string    `json:"booking_status"`
-	OwnerUserID   *int64    `json:"owner_user_id,omitempty"`
-	Owner         string    `json:"owner"`
-	Notes         string    `json:"notes"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID              string    `json:"id"`
+	TeamID          int64     `json:"team_id"`
+	Title           string    `json:"title"`
+	Venue           string    `json:"venue"`
+	StartsAt        time.Time `json:"starts_at"`
+	BookingStatus   string    `json:"booking_status"`
+	PerformanceType string    `json:"performance_type"`
+	TicketLink      string    `json:"ticket_link"`
+	OwnerUserID     *int64    `json:"owner_user_id,omitempty"`
+	Owner           string    `json:"owner"`
+	Notes           string    `json:"notes"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // Tag is a searchable team tag; inactive tags remain attached to old content.

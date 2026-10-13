@@ -164,13 +164,60 @@ paths:
         '403': { description: Owner role required }
   /api/performances:
     get:
-      summary: List current-team performance bookings
+      summary: List current-team 正式演出 with persisted promotional-video counters
+      description: >-
+        Each row reports content_count, published_content_count,
+        unpublished_content_count, schedulable_content_count and
+        scheduled_content_count. Shows whose start time has passed are settled to
+        已演出 before the list is returned; 已取消 is never rewritten.
       responses:
         '200': { description: Bookings }
     post:
-      summary: Create a performance booking
+      summary: Create a 正式演出
+      description: >-
+        starts_at accepts RFC3339 or the browser's datetime-local form. Status is
+        one of 筹备中, 预热中, 已演出, 已取消.
       responses:
-        '201': { description: Booking created }
+        '201': { description: Show created with its counters }
+        '422': { description: Invalid title, time, status or owner }
+  /api/performances/{id}:
+    get:
+      summary: One 正式演出 with its aggregated promotional content
+      description: >-
+        Returns the show, days_to_start, its published assets with real effect
+        data, its unpublished asset list, and the full pre-heat timeline built
+        from schedule rows.
+      responses:
+        '200': { description: Show detail }
+        '404': { description: Show does not exist in the caller's team }
+    patch:
+      summary: Update one 正式演出; editor role required
+      description: Partial update; only the submitted keys are written.
+      responses:
+        '200': { description: Updated show }
+        '404': { description: Show does not exist in the caller's team }
+        '422': { description: Invalid field value }
+    delete:
+      summary: Delete one 正式演出; editor role required
+      description: >-
+        Linked promotional videos are kept and only lose the association, so
+        deleting a show never deletes content.
+      responses:
+        '204': { description: Show deleted }
+        '404': { description: Show does not exist in the caller's team }
+  /api/performances/{id}/plan:
+    post:
+      summary: Generate the whole-show pre-heat schedule; editor role required
+      description: >-
+        Plans only the show's unpublished 待排期 videos, never past the show's
+        start time, spread across days and platforms. The result is stored as a
+        normal recommendation and adopted through POST /api/schedule/adopt.
+        Reasons state the historical evidence used; insufficient samples are
+        reported honestly instead of inventing a reason.
+      responses:
+        '200': { description: Plan with per-item reasons and sample counts }
+        '404': { description: Show does not exist in the caller's team }
+        '422': { description: The show has already started }
   /api/tags:
     get:
       summary: List current-team tags
@@ -199,6 +246,34 @@ paths:
       summary: Effective scheduling policy and its inclusive planning window
       responses:
         '200': { description: 'planning_horizon_days counts natural days starting today, so the window is today .. today + N - 1' }
+  /api/schedule:
+    get:
+      summary: Calendar rows in an inclusive date range
+      parameters:
+        - { name: start, in: query, required: true, schema: { type: string, format: date } }
+        - { name: end, in: query, required: true, schema: { type: string, format: date } }
+        - name: performance_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Restrict the calendar to one 正式演出 through content.performance_id
+      responses:
+        '200': { description: 'Plans with pure YYYY-MM-DD planned_date values' }
+  /api/schedule/{id}/adjustments:
+    get:
+      summary: Recorded manual changes of one plan
+      description: Manual edits are marked source=manual and logged with their before/after values.
+      responses:
+        '200': { description: Adjustment entries with actor, detail and created_at }
+  /api/stats/performances:
+    get:
+      summary: Published effect data aggregated per 正式演出
+      description: >-
+        Shows without published videos are reported with zero samples instead of
+        being dropped; a per-show sample_sufficient flag and the team baseline
+        travel with the response.
+      responses:
+        '200': { description: 'Per-show comparison plus min_sample and baseline' }
   /api/stats/platform:
     get:
       summary: Published-only metrics by platform

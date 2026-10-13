@@ -10,10 +10,10 @@ ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO performance_booking (
     id, team_id, title, venue, starts_at, booking_status,
-    owner_user_id, notes, created_at
+    performance_type, ticket_link, owner_user_id, notes, created_at
 ) VALUES
-    ('00000000-0000-4000-8000-000000000101', 1, '春季折子戏专场', '云锦小剧场', CURRENT_TIMESTAMP + INTERVAL '18 days', '已预订', NULL, '示例演出：含开场介绍、经典折子戏和谢幕环节。', NOW()),
-    ('00000000-0000-4000-8000-000000000102', 1, '青年演员技艺展演', '城市艺术中心', CURRENT_TIMESTAMP + INTERVAL '35 days', '已预订', NULL, '示例演出：展示唱念做打与后台准备过程。', NOW())
+    ('00000000-0000-4000-8000-000000000101', 1, '春季折子戏专场', '云锦小剧场', CURRENT_TIMESTAMP + INTERVAL '18 days', '筹备中', '地方戏', '', NULL, '示例演出：含开场介绍、经典折子戏和谢幕环节。', NOW()),
+    ('00000000-0000-4000-8000-000000000102', 1, '青年演员技艺展演', '城市艺术中心', CURRENT_TIMESTAMP + INTERVAL '35 days', '筹备中', '综合展演', '', NULL, '示例演出：展示唱念做打与后台准备过程。', NOW())
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO tag (team_id, name, normalized_name, color, is_active, created_by_user_id, created_at)

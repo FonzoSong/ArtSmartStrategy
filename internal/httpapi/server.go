@@ -71,6 +71,10 @@ func New(cfg config.Config, store *repository.Postgres, logger *slog.Logger) htt
 	mux.Handle("POST /api/users", server.authenticated(server.owners(http.HandlerFunc(server.addUser))))
 	mux.Handle("GET /api/performances", server.authenticated(http.HandlerFunc(server.performances)))
 	mux.Handle("POST /api/performances", server.authenticated(server.editors(http.HandlerFunc(server.createPerformance))))
+	mux.Handle("GET /api/performances/{id}", server.authenticated(http.HandlerFunc(server.performanceDetail)))
+	mux.Handle("PATCH /api/performances/{id}", server.authenticated(server.editors(http.HandlerFunc(server.updatePerformance))))
+	mux.Handle("DELETE /api/performances/{id}", server.authenticated(server.editors(http.HandlerFunc(server.deletePerformance))))
+	mux.Handle("POST /api/performances/{id}/plan", server.authenticated(server.editors(http.HandlerFunc(server.planPerformance))))
 	mux.Handle("GET /api/tags", server.authenticated(http.HandlerFunc(server.tags)))
 	mux.Handle("POST /api/tags", server.authenticated(server.editors(http.HandlerFunc(server.createTag))))
 	mux.Handle("PATCH /api/tags/{id}", server.authenticated(server.editors(http.HandlerFunc(server.updateTag))))
@@ -87,6 +91,15 @@ func New(cfg config.Config, store *repository.Postgres, logger *slog.Logger) htt
 	mux.Handle("POST /api/settings/sample-threshold", server.authenticated(server.owners(http.HandlerFunc(server.sampleThreshold))))
 	mux.Handle("GET /api/rules", server.authenticated(http.HandlerFunc(server.rules)))
 	mux.Handle("GET /api/rules/system", server.authenticated(http.HandlerFunc(server.systemRules)))
+	mux.Handle("GET /api/rules/sets", server.authenticated(http.HandlerFunc(server.ruleSets)))
+	mux.Handle("POST /api/rules/sets", server.authenticated(server.editors(http.HandlerFunc(server.createRuleSet))))
+	mux.Handle("PATCH /api/rules/sets/{id}", server.authenticated(server.editors(http.HandlerFunc(server.updateRuleSet))))
+	mux.Handle("DELETE /api/rules/sets/{id}", server.authenticated(server.editors(http.HandlerFunc(server.deleteRuleSet))))
+	mux.Handle("PUT /api/rules/effective", server.authenticated(server.editors(http.HandlerFunc(server.setEffectiveRuleSet))))
+	mux.Handle("POST /api/rules/sets/{id}/items", server.authenticated(server.editors(http.HandlerFunc(server.addRuleSetItem))))
+	mux.Handle("PATCH /api/rules/sets/{id}/items/{itemId}", server.authenticated(server.editors(http.HandlerFunc(server.updateRuleSetItem))))
+	mux.Handle("DELETE /api/rules/sets/{id}/items/{itemId}", server.authenticated(server.editors(http.HandlerFunc(server.deleteRuleSetItem))))
+	mux.Handle("POST /api/rules/sets/preview", server.authenticated(server.editors(http.HandlerFunc(server.previewRuleSetItem))))
 	mux.Handle("POST /api/rules", server.authenticated(server.editors(http.HandlerFunc(server.createRule))))
 	mux.Handle("POST /api/rules/preview", server.authenticated(server.editors(http.HandlerFunc(server.previewRule))))
 	mux.Handle("POST /api/rules/evaluate", server.authenticated(server.editors(http.HandlerFunc(server.evaluateRules))))
@@ -103,6 +116,7 @@ func New(cfg config.Config, store *repository.Postgres, logger *slog.Logger) htt
 	mux.Handle("GET /api/stats/adoption", server.authenticated(http.HandlerFunc(server.adoptionStats)))
 	mux.Handle("GET /api/stats/funnel", server.authenticated(http.HandlerFunc(server.funnelStats)))
 	mux.Handle("GET /api/stats/diagnostics", server.authenticated(http.HandlerFunc(server.diagnostics)))
+	mux.Handle("GET /api/stats/performances", server.authenticated(http.HandlerFunc(server.performanceComparison)))
 	mux.Handle("GET /api/benchmark", server.authenticated(http.HandlerFunc(server.benchmarks)))
 	mux.Handle("PUT /api/benchmark", server.authenticated(server.editors(http.HandlerFunc(server.updateBenchmark))))
 	mux.Handle("GET /api/export/contents", server.authenticated(http.HandlerFunc(server.exportContentsCSV)))
@@ -122,6 +136,7 @@ func New(cfg config.Config, store *repository.Postgres, logger *slog.Logger) htt
 	mux.Handle("GET /api/schedule/policy", server.authenticated(http.HandlerFunc(server.schedulePolicy)))
 	mux.Handle("POST /api/schedule/adopt", server.authenticated(server.editors(http.HandlerFunc(server.adoptSchedules))))
 	mux.Handle("PATCH /api/schedule/{id}", server.authenticated(server.editors(http.HandlerFunc(server.updateSchedule))))
+	mux.Handle("GET /api/schedule/{id}/adjustments", server.authenticated(http.HandlerFunc(server.scheduleAdjustments)))
 	mux.Handle("POST /api/schedule/{id}/publish", server.authenticated(server.editors(http.HandlerFunc(server.publishSchedule))))
 	mux.Handle("POST /api/ai/recommend", server.authenticated(server.editors(http.HandlerFunc(server.generateRecommendations))))
 	mux.Handle("GET /api/recommendations", server.authenticated(http.HandlerFunc(server.recommendations)))
@@ -296,12 +311,20 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) contents(w http.ResponseWriter, r *http.Request) {
-	items, err := s.Store.ListContents(r.Context(), claimsFrom(r).TeamID)
+	teamID := claimsFrom(r).TeamID
+	items, err := s.Store.ListContents(r.Context(), teamID)
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "contents_failed", "读取内容记录失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items)})
+	// Category counts come from the database aggregation so the tab badges show
+	// the real totals instead of the current page length.
+	counts, err := s.Store.ContentCategoryCounts(r.Context(), teamID)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "contents_counts_failed", "读取内容分类统计失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items), "counts": counts})
 }
 
 func (s *Server) content(w http.ResponseWriter, r *http.Request) {
@@ -337,7 +360,8 @@ func (s *Server) createContent(w http.ResponseWriter, r *http.Request) {
 	input.WorkflowState = domain.WorkflowProductionPending
 	input.Lifecycle = domain.LifecycleUnpublished
 	c := claimsFrom(r)
-	if message := s.contentRuleFailure(r, c.TeamID, input.Title+"\n"+input.Notes, input.Tags, input.Category, input.WorkflowState); message != "" {
+	facts := contentFacts(input)
+	if message := s.contentRuleFailure(r, c.TeamID, facts, input.Title+"\n"+input.Notes, input.Tags, input.Category, input.WorkflowState); message != "" {
 		writeError(w, r, 422, "content_rule_failed", message)
 		return
 	}
@@ -367,7 +391,19 @@ func (s *Server) updateContent(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		if message := s.contentRuleFailure(r, c.TeamID, title+"\n"+notes, tags, category, state); message != "" {
+		facts := map[string]any{"title": title, "notes": notes, "category": category, "workflow_state": state}
+		if item, loadErr := s.Store.GetContent(r.Context(), c.TeamID, r.PathValue("id")); loadErr == nil {
+			for key, value := range item {
+				if _, exists := facts[key]; !exists {
+					facts[key] = value
+				}
+			}
+		}
+		for key, value := range input {
+			facts[key] = value
+		}
+		facts["category"], facts["workflow_state"], facts["title"], facts["notes"] = category, state, title, notes
+		if message := s.contentRuleFailure(r, c.TeamID, facts, title+"\n"+notes, tags, category, state); message != "" {
 			writeError(w, r, 422, "content_rule_failed", message)
 			return
 		}
@@ -490,6 +526,12 @@ func (s *Server) bulkContents(w http.ResponseWriter, r *http.Request) {
 	for i, id := range input.IDs {
 		args = append(args, id)
 		placeholders[i] = "$" + strconv.Itoa(i+2)
+	}
+	// Plans belong to their content record, so remove them first: the schedule
+	// foreign key would otherwise reject the content deletion.
+	if _, execErr := tx.ExecContext(r.Context(), `DELETE FROM schedule WHERE team_id=$1 AND content_id IN (`+strings.Join(placeholders, ",")+`)`, args...); execErr != nil {
+		writeError(w, r, 500, "bulk_delete_failed", "批量删除关联排期失败")
+		return
 	}
 	result, execErr := tx.ExecContext(r.Context(), `DELETE FROM content WHERE team_id=$1 AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if execErr != nil {
@@ -889,27 +931,79 @@ func validateRuleInput(in ruleInput) error {
 	return nil
 }
 
-func (s *Server) contentRuleFailure(r *http.Request, teamID int64, text string, tags []string, category, state string) string {
-	rows, err := s.Store.ListTeamRows(r.Context(), `SELECT name,rule_type,rule_content,content_type,workflow_state FROM content_rule WHERE team_id=$1 AND enabled=TRUE AND trigger IN ('on_save','on_create') ORDER BY priority,id`, teamID)
+// contentRuleFailure evaluates the team's *effective* rule set against the
+// content being saved.
+//
+//   - a custom rule set holds validation rules: a match rejects the content;
+//   - the system rule set holds governance rules: its matches are evaluated
+//     against real data and recorded in the execution log instead of rejecting.
+//
+// Either way the rules that run are the ones selected in team_rule_selection, so
+// the page and the engine cannot drift apart.
+func (s *Server) contentRuleFailure(r *http.Request, teamID int64, facts map[string]any, text string, tags []string, category, state string) string {
+	kind, setID, err := s.effectiveRuleSelection(r.Context(), teamID)
 	if err != nil {
-		return "无法加载内容校验规则"
+		return "无法读取生效规则集"
 	}
-	for _, row := range rows {
-		if row["content_type"] != "" && row["content_type"] != category {
-			continue
-		}
-		if row["workflow_state"] != "" && row["workflow_state"] != state {
-			continue
-		}
-		result, err := service.EvaluateRule(fmt.Sprint(row["rule_type"]), fmt.Sprint(row["rule_content"]), text, tags)
+	if setID == 0 {
+		return ""
+	}
+	if kind == "custom" {
+		rows, err := s.Store.ListTeamRows(r.Context(), `SELECT name,rule_type,rule_content,content_type,workflow_state FROM content_rule_set_item WHERE rule_set_id=$1 AND enabled=TRUE ORDER BY priority,id`, setID)
 		if err != nil {
-			return "规则 " + fmt.Sprint(row["name"]) + " 配置错误：" + err.Error()
+			return "无法加载内容校验规则"
 		}
-		if result.Matched {
-			return "未通过内容规则：" + fmt.Sprint(row["name"])
+		for _, row := range rows {
+			if row["content_type"] != "" && row["content_type"] != category {
+				continue
+			}
+			if row["workflow_state"] != "" && row["workflow_state"] != state {
+				continue
+			}
+			result, err := service.EvaluateRule(fmt.Sprint(row["rule_type"]), fmt.Sprint(row["rule_content"]), text, tags)
+			if err != nil {
+				return "规则 " + fmt.Sprint(row["name"]) + " 配置错误：" + err.Error()
+			}
+			if result.Matched {
+				return "未通过内容规则：" + fmt.Sprint(row["name"])
+			}
 		}
+		return ""
 	}
+	s.logGovernanceHits(r, teamID, setID, facts)
 	return ""
+}
+
+// logGovernanceHits evaluates the system rule set's rules against the content and
+// records the outcome so the rules page shows what the engine actually did.
+func (s *Server) logGovernanceHits(r *http.Request, teamID, setID int64, facts map[string]any) {
+	var raw []byte
+	if err := s.Store.DB.QueryRowContext(r.Context(), `SELECT payload_json->'rules' FROM system_rule_set WHERE id=$1`, setID).Scan(&raw); err != nil {
+		return
+	}
+	rules, err := service.ParseGovernanceRules(raw)
+	if err != nil {
+		return
+	}
+	for _, rule := range rules {
+		if !rule.Enabled {
+			continue
+		}
+		matched, reason, evalErr := service.EvaluateGovernanceRule(rule, facts)
+		result := "no_match"
+		detail := reason
+		if evalErr != nil {
+			result = "error"
+			detail = evalErr.Error()
+		} else if matched {
+			result = "matched"
+		}
+		contentID := stringField(facts, "id")
+		if contentID == "" {
+			contentID = "pending"
+		}
+		_, _ = s.Store.DB.ExecContext(r.Context(), `INSERT INTO rule_execution_log(team_id,rule_id,rule_name,content_id,trigger,result,detail,created_at) VALUES($1,NULL,$2,$3,'content.save',$4,$5,NOW())`, teamID, rule.Name, contentID, result, detail)
+	}
 }
 
 func stringSlice(raw any) []string {
@@ -928,7 +1022,15 @@ func stringSlice(raw any) []string {
 }
 
 func (s *Server) performances(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.Store.ListPerformances(r.Context(), claimsFrom(r).TeamID)
+	teamID := claimsFrom(r).TeamID
+	// The expiry rule is applied before reading, so a show that has already
+	// started is reported as 已演出 without any client-side guesswork. Already
+	// cancelled shows are never rewritten.
+	if _, err := s.Store.SettlePerformanceStatuses(r.Context(), teamID); err != nil {
+		writeError(w, r, 500, "performances_failed", "更新演出状态失败")
+		return
+	}
+	rows, err := s.Store.ListPerformances(r.Context(), teamID)
 	if err != nil {
 		writeError(w, r, 500, "performances_failed", "读取演出预订失败")
 		return
@@ -937,9 +1039,28 @@ func (s *Server) performances(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createPerformance(w http.ResponseWriter, r *http.Request) {
-	var input domain.Performance
-	if !decode(w, r, &input) {
+	var payload struct {
+		Title           string       `json:"title"`
+		Venue           string       `json:"venue"`
+		StartsAt        flexibleTime `json:"starts_at"`
+		BookingStatus   string       `json:"booking_status"`
+		PerformanceType string       `json:"performance_type"`
+		TicketLink      string       `json:"ticket_link"`
+		OwnerUserID     *int64       `json:"owner_user_id"`
+		Notes           string       `json:"notes"`
+	}
+	if !decode(w, r, &payload) {
 		return
+	}
+	input := domain.Performance{
+		Title:           payload.Title,
+		Venue:           payload.Venue,
+		StartsAt:        payload.StartsAt.Time,
+		BookingStatus:   payload.BookingStatus,
+		PerformanceType: payload.PerformanceType,
+		TicketLink:      payload.TicketLink,
+		OwnerUserID:     payload.OwnerUserID,
+		Notes:           payload.Notes,
 	}
 	c := claimsFrom(r)
 	result, err := s.Store.CreatePerformanceBooking(r.Context(), c.TeamID, c.UserID, c.Name, input)
@@ -948,6 +1069,258 @@ func (s *Server) createPerformance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, result)
+}
+
+// performanceDetail returns one show together with its aggregated promotional
+// content, its real effect data and the pre-heat timeline.
+func (s *Server) performanceDetail(w http.ResponseWriter, r *http.Request) {
+	teamID := claimsFrom(r).TeamID
+	id := r.PathValue("id")
+	if _, err := s.Store.SettlePerformanceStatuses(r.Context(), teamID); err != nil {
+		writeError(w, r, 500, "performance_failed", "更新演出状态失败")
+		return
+	}
+	detail, err := s.Store.GetPerformance(r.Context(), teamID, id)
+	if err != nil {
+		notFoundOrError(w, r, err, "演出不存在")
+		return
+	}
+	content, err := s.Store.GetPerformanceContent(r.Context(), teamID, id)
+	if err != nil {
+		writeError(w, r, 500, "performance_content_failed", "读取演出关联内容失败")
+		return
+	}
+	var daysToStart *int
+	if startsAt, ok := timeField(detail, "starts_at"); ok {
+		now := time.Now()
+		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		showDay := time.Date(startsAt.Year(), startsAt.Month(), startsAt.Day(), 0, 0, 0, 0, startsAt.Location())
+		days := int(showDay.Sub(today).Hours() / 24)
+		daysToStart = &days
+	}
+	writeJSON(w, 200, map[string]any{
+		"performance":    detail,
+		"days_to_start":  daysToStart,
+		"published":      content["published"],
+		"unpublished":    content["unpublished"],
+		"timeline":       content["timeline"],
+		"counts":         map[string]any{"content_count": intField(detail, "content_count"), "published_content_count": intField(detail, "published_content_count"), "unpublished_content_count": intField(detail, "unpublished_content_count"), "schedulable_content_count": intField(detail, "schedulable_content_count"), "scheduled_content_count": intField(detail, "scheduled_content_count")},
+		"status_options": domain.PerformanceStatuses(),
+	})
+}
+
+// performancePatch decodes a partial show update. Unknown keys are rejected and
+// only the keys actually present are written.
+func performancePatch(input map[string]any) (domain.Performance, map[string]bool, error) {
+	var perf domain.Performance
+	fields := map[string]bool{}
+	for key, value := range input {
+		switch key {
+		case "title", "venue", "booking_status", "performance_type", "ticket_link", "notes":
+			text, ok := value.(string)
+			if !ok {
+				return perf, fields, fmt.Errorf("%s 必须是文本", key)
+			}
+			switch key {
+			case "title":
+				perf.Title = text
+			case "venue":
+				perf.Venue = text
+			case "booking_status":
+				perf.BookingStatus = text
+			case "performance_type":
+				perf.PerformanceType = text
+			case "ticket_link":
+				perf.TicketLink = text
+			case "notes":
+				perf.Notes = text
+			}
+			fields[key] = true
+		case "starts_at":
+			raw, ok := value.(string)
+			if !ok {
+				return perf, fields, errors.New("演出时间格式必须为 RFC3339 或 YYYY-MM-DDTHH:MM")
+			}
+			parsed, err := parseFlexibleTime(raw)
+			if err != nil {
+				return perf, fields, err
+			}
+			perf.StartsAt = parsed
+			fields["starts_at"] = true
+		case "owner_user_id":
+			switch typed := value.(type) {
+			case nil:
+				perf.OwnerUserID = nil
+			case float64:
+				id := int64(typed)
+				perf.OwnerUserID = &id
+			default:
+				return perf, fields, errors.New("负责人 ID 无效")
+			}
+			fields["owner_user_id"] = true
+		case "id", "team_id", "owner", "created_at":
+			// Server-managed: accepted but ignored so a read-modify-write of a
+			// fetched record does not fail on its own metadata.
+		default:
+			return perf, fields, fmt.Errorf("不支持的字段：%s", key)
+		}
+	}
+	return perf, fields, nil
+}
+
+// parseFlexibleTime accepts the timestamp layouts the web client can submit.
+func parseFlexibleTime(raw string) (time.Time, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return time.Time{}, errors.New("演出时间为必填项")
+	}
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02T15:04:05", "2006-01-02"} {
+		if parsed, err := time.Parse(layout, trimmed); err == nil {
+			return parsed, nil
+		}
+	}
+	return time.Time{}, errors.New("演出时间格式必须为 RFC3339 或 YYYY-MM-DDTHH:MM")
+}
+
+func (s *Server) updatePerformance(w http.ResponseWriter, r *http.Request) {
+	var input map[string]any
+	if !decode(w, r, &input) {
+		return
+	}
+	perf, fields, err := performancePatch(input)
+	if err != nil {
+		writeError(w, r, 422, "performance_invalid", err.Error())
+		return
+	}
+	if len(fields) == 0 {
+		writeError(w, r, 422, "performance_invalid", "没有需要更新的字段")
+		return
+	}
+	c := claimsFrom(r)
+	item, err := s.Store.UpdatePerformanceBooking(r.Context(), c.TeamID, c.Name, r.PathValue("id"), perf, fields)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, r, 404, "performance_not_found", "演出不存在")
+			return
+		}
+		writeError(w, r, 422, "performance_invalid", err.Error())
+		return
+	}
+	writeJSON(w, 200, item)
+}
+
+func (s *Server) deletePerformance(w http.ResponseWriter, r *http.Request) {
+	c := claimsFrom(r)
+	if err := s.Store.DeletePerformanceBooking(r.Context(), c.TeamID, c.Name, r.PathValue("id")); err != nil {
+		notFoundOrError(w, r, err, "删除演出失败")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// planPerformance generates the whole-show pre-heat schedule for one 正式演出.
+// It reuses the shared candidate, history, rule-set and adoption machinery, so
+// the produced items are stored as a normal recommendation and adopted through
+// POST /api/schedule/adopt instead of a parallel scheduling flow.
+func (s *Server) planPerformance(w http.ResponseWriter, r *http.Request) {
+	c := claimsFrom(r)
+	show, err := s.Store.GetPerformance(r.Context(), c.TeamID, r.PathValue("id"))
+	if err != nil {
+		notFoundOrError(w, r, err, "演出不存在")
+		return
+	}
+	startsAt, ok := timeField(show, "starts_at")
+	if !ok {
+		writeError(w, r, 422, "performance_invalid", "演出时间无效，无法生成排期")
+		return
+	}
+	if !startsAt.After(time.Now()) {
+		writeError(w, r, 422, "performance_started", "演出时间已过，无法生成预热排期")
+		return
+	}
+	// Only unpublished videos that already finished production can be planned,
+	// which is the same eligibility rule the suggestion page uses.
+	rows, err := s.Store.QueryMaps(r.Context(), `
+		SELECT id,title,category,platform,owner,lifecycle,workflow_state
+		FROM content
+		WHERE team_id=$1 AND performance_id=$2 AND lifecycle='未发布' AND workflow_state='待排期'
+		  AND NOT EXISTS (SELECT 1 FROM schedule WHERE schedule.team_id=content.team_id AND schedule.content_id=content.id AND schedule.status='待发布')
+		ORDER BY created_at, id`, c.TeamID, r.PathValue("id"))
+	if err != nil {
+		writeError(w, r, 500, "candidate_query_failed", "读取演出预热内容失败")
+		return
+	}
+	candidates := make([]domain.Content, 0, len(rows))
+	for _, row := range rows {
+		candidates = append(candidates, domain.Content{
+			ID: stringField(row, "id"), Title: stringField(row, "title"),
+			Category: stringField(row, "category"), Platform: stringField(row, "platform"),
+			Owner: stringField(row, "owner"), Lifecycle: stringField(row, "lifecycle"),
+			WorkflowState: stringField(row, "workflow_state"),
+		})
+	}
+	policy, window, ruleErr := s.loadPlanningRules(r.Context())
+	if ruleErr != nil {
+		writeRuleSetError(w, r, ruleErr)
+		return
+	}
+	policy.ExistingDaily, policy.ExistingPlatformWeekly = map[string]int{}, map[string]int{}
+	if err = s.loadExistingScheduleLoad(r.Context(), c.TeamID, &policy); err != nil {
+		writeError(w, r, 500, "schedule_capacity_failed", "读取既有排期频率失败")
+		return
+	}
+	samples, err := s.loadPublishedSamples(r.Context(), c.TeamID)
+	if err != nil {
+		writeError(w, r, 500, "history_query_failed", "读取已发布历史表现失败")
+		return
+	}
+	items, insufficient := service.BuildPerformancePlan(service.PerformancePlanInput{
+		Now:        time.Now(),
+		ShowTitle:  stringField(show, "title"),
+		StartsAt:   startsAt,
+		Candidates: candidates,
+		Samples:    samples,
+		Policy:     policy,
+	})
+	items = s.annotateSuggestionValidity(r.Context(), c.TeamID, items, policy, window)
+	referenceCount := 0
+	for _, item := range items {
+		referenceCount += item.ReferenceSampleCount
+	}
+	status := "performance_plan"
+	fallbackReason := ""
+	if len(candidates) == 0 {
+		status = "no_candidates"
+		fallbackReason = "该演出下没有符合排期条件的未发布内容：内容需先推进到「待排期」且尚未有生效排期。"
+	}
+	if insufficient && len(items) > 0 {
+		fallbackReason = "样本不足，当前排期基于通用规则生成。"
+	}
+	payload := map[string]any{"performance_id": r.PathValue("id"), "recommendations": items}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		writeError(w, r, 500, "recommendation_encode_failed", "编码排期失败")
+		return
+	}
+	id := uuid.NewString()
+	_, err = s.Store.DB.ExecContext(r.Context(), `INSERT INTO recommendation(id,team_id,generated_at,payload_json,source_model,source_label,confidence,reference_count,analysis_status,fallback_reason,adopted) VALUES($1,$2,NOW(),$3,'rules',$4,$5,$6,$7,$8,FALSE)`,
+		id, c.TeamID, string(payloadJSON), "整场排期（规则引擎）", map[bool]string{true: "low", false: "medium"}[insufficient], referenceCount, status, fallbackReason)
+	if err != nil {
+		writeError(w, r, 500, "recommendation_save_failed", "保存整场排期失败")
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"id": id, "performance_id": r.PathValue("id"),
+		"source": "整场排期（规则引擎）", "source_label": "整场排期（规则引擎）",
+		"analysis_status": status, "reference_count": referenceCount,
+		"confidence": map[bool]string{true: "low", false: "medium"}[insufficient],
+		"confidence_note": map[bool]string{
+			true:  "团队历史样本不足，排期主要依据规则集与内容类型搭配。",
+			false: "基于该团队自己的历史发布数据；结果不构成效果保证。",
+		}[insufficient],
+		"fallback_reason": fallbackReason,
+		"recommendations": items,
+	})
 }
 
 func (s *Server) tags(w http.ResponseWriter, r *http.Request) {
@@ -1075,27 +1448,13 @@ func (s *Server) mergeTag(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"merged": true, "source_id": sourceID, "target_id": input.TargetID})
 }
 
-type modelSettings struct {
-	Name              string  `json:"name"`
-	BaseURL           string  `json:"base_url"`
-	Model             string  `json:"model"`
-	APIKey            string  `json:"api_key"`
-	MinSample         int     `json:"min_sample"`
-	CompletionWeight  float64 `json:"score_completion_weight"`
-	InteractionWeight float64 `json:"score_interaction_weight"`
-	Temperature       float64 `json:"temperature"`
-	RequestMode       string  `json:"request_mode"`
-	AuthType          string  `json:"auth_type"`
-}
-
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	c := claimsFrom(r)
 	var value modelSettings
 	var storedKey string
-	err := s.Store.DB.QueryRowContext(r.Context(), `SELECT name,base_url,model,api_key,min_sample,score_completion_weight,score_interaction_weight,temperature,request_mode,auth_type FROM ai_config WHERE team_id=$1 AND enabled=TRUE ORDER BY updated_at DESC LIMIT 1`, c.TeamID).Scan(&value.Name, &value.BaseURL, &value.Model, &storedKey, &value.MinSample, &value.CompletionWeight, &value.InteractionWeight, &value.Temperature, &value.RequestMode, &value.AuthType)
+	err := s.Store.DB.QueryRowContext(r.Context(), `SELECT name,base_url,model,api_key,min_sample,score_completion_weight,score_interaction_weight,temperature,request_mode,auth_type,enabled,fallback_enabled,COALESCE(platform_weights_json,'{}') FROM ai_config WHERE team_id=$1 ORDER BY updated_at DESC LIMIT 1`, c.TeamID).Scan(&value.Name, &value.BaseURL, &value.Model, &storedKey, &value.MinSample, &value.CompletionWeight, &value.InteractionWeight, &value.Temperature, &value.RequestMode, &value.AuthType, &value.Enabled, &value.FallbackEnabled, &value.PlatformWeightsRaw)
 	if errors.Is(err, sql.ErrNoRows) {
-		keyConfigured := s.Config.AIAPIKey != ""
-		writeJSON(w, 200, map[string]any{"configured": keyConfigured, "has_key": keyConfigured, "name": "默认模型", "base_url": s.Config.AIBaseURL, "model": s.Config.AIModel, "min_sample": 3, "score_completion_weight": 0.6, "score_interaction_weight": 0.4, "temperature": 0.3, "request_mode": "base", "auth_type": "bearer"})
+		writeJSON(w, 200, settingsResponse(defaultModelSettings(s.Config.AIBaseURL, s.Config.AIModel), s.Config.AIAPIKey != "", "AI_API_KEY"))
 		return
 	}
 	if err != nil {
@@ -1103,7 +1462,39 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	keyConfigured := storedKey != "" || s.Config.AIAPIKey != ""
-	writeJSON(w, 200, map[string]any{"configured": keyConfigured, "has_key": keyConfigured, "name": value.Name, "base_url": value.BaseURL, "model": value.Model, "min_sample": value.MinSample, "score_completion_weight": value.CompletionWeight, "score_interaction_weight": value.InteractionWeight, "temperature": value.Temperature, "request_mode": value.RequestMode, "auth_type": value.AuthType})
+	writeJSON(w, 200, settingsResponse(value, keyConfigured, "已保存的模型密钥"))
+}
+
+// settingsResponse never exposes the stored API key, only whether one is
+// configured and a masked hint.
+func settingsResponse(value modelSettings, keyConfigured bool, hint string) map[string]any {
+	payload := map[string]any{
+		"configured":               keyConfigured,
+		"has_key":                  keyConfigured,
+		"name":                     value.Name,
+		"base_url":                 value.BaseURL,
+		"model":                    value.Model,
+		"min_sample":               value.MinSample,
+		"score_completion_weight":  value.CompletionWeight,
+		"score_interaction_weight": value.InteractionWeight,
+		"temperature":              value.Temperature,
+		"request_mode":             value.RequestMode,
+		"auth_type":                value.AuthType,
+		"enabled":                  value.Enabled,
+		"fallback_enabled":         value.FallbackEnabled,
+		"platform_weights":         json.RawMessage(orEmptyJSONObject(value.PlatformWeightsRaw)),
+	}
+	if keyConfigured {
+		payload["key_hint"] = hint
+	}
+	return payload
+}
+
+func orEmptyJSONObject(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return "{}"
+	}
+	return raw
 }
 
 func (s *Server) aiConfigs(w http.ResponseWriter, r *http.Request) {
@@ -1116,7 +1507,7 @@ func (s *Server) aiConfigs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createAIConfig(w http.ResponseWriter, r *http.Request) {
-	var input modelSettings
+	var input aiConfigInput
 	if !decode(w, r, &input) {
 		return
 	}
@@ -1253,56 +1644,43 @@ func openAIURL(base, path string) string {
 }
 
 func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
-	var value modelSettings
-	if !decode(w, r, &value) {
+	var input modelSettingsRequest
+	if !decode(w, r, &input) {
 		return
 	}
-	if value.Name == "" {
-		value.Name = "默认模型"
+	c := claimsFrom(r)
+	// Merge onto the stored configuration so unsent fields keep their value and
+	// the analysis thresholds are not silently reset by the model form.
+	current := defaultModelSettings(s.Config.AIBaseURL, s.Config.AIModel)
+	var storedKey string
+	err := s.Store.DB.QueryRowContext(r.Context(), `SELECT name,base_url,model,api_key,min_sample,score_completion_weight,score_interaction_weight,temperature,request_mode,auth_type,enabled,fallback_enabled,COALESCE(platform_weights_json,'{}') FROM ai_config WHERE team_id=$1 ORDER BY updated_at DESC LIMIT 1`, c.TeamID).Scan(&current.Name, &current.BaseURL, &current.Model, &storedKey, &current.MinSample, &current.CompletionWeight, &current.InteractionWeight, &current.Temperature, &current.RequestMode, &current.AuthType, &current.Enabled, &current.FallbackEnabled, &current.PlatformWeightsRaw)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		writeError(w, r, 500, "settings_failed", "读取模型配置失败")
+		return
 	}
-	if value.BaseURL == "" {
-		value.BaseURL = s.Config.AIBaseURL
-	}
-	if value.Model == "" {
-		value.Model = s.Config.AIModel
-	}
-	if value.MinSample < 1 {
-		value.MinSample = 3
-	}
-	if value.CompletionWeight == 0 {
-		value.CompletionWeight = .6
-	}
-	if value.InteractionWeight == 0 {
-		value.InteractionWeight = .4
-	}
-	if value.RequestMode == "" {
-		value.RequestMode = "base"
-	}
-	if value.AuthType == "" {
-		value.AuthType = "bearer"
+	value, err := mergeModelSettings(current, input)
+	if err != nil {
+		writeError(w, r, 422, "settings_invalid", err.Error())
+		return
 	}
 	apiKey := ""
-	if value.APIKey != "" {
-		encrypted, err := service.SealSecret(s.Config.AppSecret, value.APIKey)
+	if input.APIKey != nil && strings.TrimSpace(*input.APIKey) != "" {
+		encrypted, err := service.SealSecret(s.Config.AppSecret, strings.TrimSpace(*input.APIKey))
 		if err != nil {
 			writeError(w, r, 500, "credential_encrypt_failed", "安全保存模型密钥失败")
 			return
 		}
 		apiKey = encrypted
 	}
-	c := claimsFrom(r)
 	var id int64
-	err := s.Store.DB.QueryRowContext(r.Context(), `SELECT id FROM ai_config WHERE team_id=$1 ORDER BY updated_at DESC LIMIT 1`, c.TeamID).Scan(&id)
+	err = s.Store.DB.QueryRowContext(r.Context(), `SELECT id FROM ai_config WHERE team_id=$1 ORDER BY updated_at DESC LIMIT 1`, c.TeamID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
-		if apiKey == "" && s.Config.AIAPIKey != "" {
-			apiKey = ""
-		}
-		_, err = s.Store.DB.ExecContext(r.Context(), `INSERT INTO ai_config(team_id,name,base_url,api_key,model,temperature,request_mode,auth_type,enabled,fallback_enabled,score_completion_weight,score_interaction_weight,min_sample,platform_weights_json,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,TRUE,TRUE,$9,$10,$11,'{}',NOW())`, c.TeamID, value.Name, value.BaseURL, apiKey, value.Model, value.Temperature, value.RequestMode, value.AuthType, value.CompletionWeight, value.InteractionWeight, value.MinSample)
+		_, err = s.Store.DB.ExecContext(r.Context(), `INSERT INTO ai_config(team_id,name,base_url,api_key,model,temperature,request_mode,auth_type,enabled,fallback_enabled,score_completion_weight,score_interaction_weight,min_sample,platform_weights_json,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())`, c.TeamID, value.Name, value.BaseURL, apiKey, value.Model, value.Temperature, value.RequestMode, value.AuthType, value.Enabled, value.FallbackEnabled, value.CompletionWeight, value.InteractionWeight, value.MinSample, value.PlatformWeightsRaw)
 	} else if err == nil {
 		if apiKey == "" {
-			_, err = s.Store.DB.ExecContext(r.Context(), `UPDATE ai_config SET name=$1,base_url=$2,model=$3,temperature=$4,request_mode=$5,auth_type=$6,score_completion_weight=$7,score_interaction_weight=$8,min_sample=$9,updated_at=NOW() WHERE id=$10 AND team_id=$11`, value.Name, value.BaseURL, value.Model, value.Temperature, value.RequestMode, value.AuthType, value.CompletionWeight, value.InteractionWeight, value.MinSample, id, c.TeamID)
+			_, err = s.Store.DB.ExecContext(r.Context(), `UPDATE ai_config SET name=$1,base_url=$2,model=$3,temperature=$4,request_mode=$5,auth_type=$6,score_completion_weight=$7,score_interaction_weight=$8,min_sample=$9,enabled=$10,fallback_enabled=$11,platform_weights_json=$12,updated_at=NOW() WHERE id=$13 AND team_id=$14`, value.Name, value.BaseURL, value.Model, value.Temperature, value.RequestMode, value.AuthType, value.CompletionWeight, value.InteractionWeight, value.MinSample, value.Enabled, value.FallbackEnabled, value.PlatformWeightsRaw, id, c.TeamID)
 		} else {
-			_, err = s.Store.DB.ExecContext(r.Context(), `UPDATE ai_config SET name=$1,base_url=$2,api_key=$3,model=$4,temperature=$5,request_mode=$6,auth_type=$7,score_completion_weight=$8,score_interaction_weight=$9,min_sample=$10,updated_at=NOW() WHERE id=$11 AND team_id=$12`, value.Name, value.BaseURL, apiKey, value.Model, value.Temperature, value.RequestMode, value.AuthType, value.CompletionWeight, value.InteractionWeight, value.MinSample, id, c.TeamID)
+			_, err = s.Store.DB.ExecContext(r.Context(), `UPDATE ai_config SET name=$1,base_url=$2,api_key=$3,model=$4,temperature=$5,request_mode=$6,auth_type=$7,score_completion_weight=$8,score_interaction_weight=$9,min_sample=$10,enabled=$11,fallback_enabled=$12,platform_weights_json=$13,updated_at=NOW() WHERE id=$14 AND team_id=$15`, value.Name, value.BaseURL, apiKey, value.Model, value.Temperature, value.RequestMode, value.AuthType, value.CompletionWeight, value.InteractionWeight, value.MinSample, value.Enabled, value.FallbackEnabled, value.PlatformWeightsRaw, id, c.TeamID)
 		}
 	}
 	if err != nil {
@@ -1330,6 +1708,7 @@ type overviewTopContent struct {
 type overviewResponse struct {
 	PublishedCount    int64                `json:"published_count"`
 	UnpublishedCount  int64                `json:"unpublished_count"`
+	TotalContentCount int64                `json:"total_content_count"`
 	TotalPosts        int64                `json:"total_posts"`
 	TotalViews        int64                `json:"total_views"`
 	TotalLikes        int64                `json:"total_likes"`
@@ -1339,6 +1718,24 @@ type overviewResponse struct {
 	SampleCount       int64                `json:"sample_count"`
 	TopContents       []overviewTopContent `json:"top_contents"`
 	Weights           map[string]float64   `json:"weights"`
+	Performances      performanceOverview  `json:"performances"`
+}
+
+// performanceOverview is the 正式演出 dimension of the operations overview. All
+// values are derived from persisted shows, content links and plans; missing data
+// is reported as zero or null instead of a fabricated number.
+type performanceOverview struct {
+	PreparingCount         int64    `json:"preparing_count"`
+	WarmingUpCount         int64    `json:"warming_up_count"`
+	PlayedCount            int64    `json:"played_count"`
+	CanceledCount          int64    `json:"canceled_count"`
+	LinkedPerformanceCount int64    `json:"linked_performance_count"`
+	UnpublishedPromoCount  int64    `json:"unpublished_promo_count"`
+	PlannedCount           int64    `json:"planned_count"`
+	PlanTotal              int64    `json:"plan_total"`
+	ScheduleCompletionRate *float64 `json:"schedule_completion_rate"`
+	NextStartsAt           string   `json:"next_starts_at"`
+	NextDaysToStart        *int     `json:"next_days_to_start"`
 }
 
 // buildOverviewResponse normalizes one aggregate row into the response contract.
@@ -1348,6 +1745,7 @@ func buildOverviewResponse(row map[string]any, top []overviewTopContent, weights
 	result := overviewResponse{
 		PublishedCount:    published,
 		UnpublishedCount:  intField(row, "unpublished_count"),
+		TotalContentCount: intField(row, "total_content_count"),
 		TotalPosts:        published,
 		TotalViews:        intField(row, "total_views"),
 		TotalLikes:        intField(row, "total_likes"),
@@ -1368,7 +1766,7 @@ func buildOverviewResponse(row map[string]any, top []overviewTopContent, weights
 // best performing published assets.
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	c := claimsFrom(r)
-	rows, err := s.Store.QueryMaps(r.Context(), `SELECT COUNT(*) FILTER (WHERE lifecycle='已发布') AS published_count, COUNT(*) FILTER (WHERE lifecycle='未发布') AS unpublished_count, COALESCE(SUM(views) FILTER (WHERE lifecycle='已发布'),0) AS total_views, COALESCE(SUM(likes) FILTER (WHERE lifecycle='已发布'),0) AS total_likes, COALESCE(SUM(total_interactions) FILTER (WHERE lifecycle='已发布'),0) AS total_interactions, COUNT(DISTINCT platform) FILTER (WHERE lifecycle='已发布') AS platform_count, COALESCE(AVG(completion) FILTER (WHERE lifecycle='已发布'),0) AS avg_completion, COUNT(*) FILTER (WHERE lifecycle='已发布') AS sample_count FROM content WHERE team_id=$1`, c.TeamID)
+	rows, err := s.Store.QueryMaps(r.Context(), `SELECT COUNT(*) AS total_content_count, COUNT(*) FILTER (WHERE lifecycle='已发布') AS published_count, COUNT(*) FILTER (WHERE lifecycle='未发布') AS unpublished_count, COALESCE(SUM(views) FILTER (WHERE lifecycle='已发布'),0) AS total_views, COALESCE(SUM(likes) FILTER (WHERE lifecycle='已发布'),0) AS total_likes, COALESCE(SUM(total_interactions) FILTER (WHERE lifecycle='已发布'),0) AS total_interactions, COUNT(DISTINCT platform) FILTER (WHERE lifecycle='已发布') AS platform_count, COALESCE(AVG(completion) FILTER (WHERE lifecycle='已发布'),0) AS avg_completion, COUNT(*) FILTER (WHERE lifecycle='已发布') AS sample_count FROM content WHERE team_id=$1`, c.TeamID)
 	if err != nil {
 		writeError(w, r, 500, "stats_failed", "统计内容表现失败")
 		return
@@ -1385,7 +1783,72 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 500, "stats_failed", "统计优质内容失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, buildOverviewResponse(row, rankTopContents(top, weights), weights))
+	response := buildOverviewResponse(row, rankTopContents(top, weights), weights)
+	performances, err := s.performanceOverviewStats(r.Context(), c.TeamID)
+	if err != nil {
+		writeError(w, r, 500, "stats_failed", "统计演出维度失败")
+		return
+	}
+	response.Performances = performances
+	writeJSON(w, http.StatusOK, response)
+}
+
+// performanceOverviewStats aggregates the show dimension used by both the
+// operations overview and the home page, so the two pages always agree.
+func (s *Server) performanceOverviewStats(ctx context.Context, teamID int64) (performanceOverview, error) {
+	stats := performanceOverview{}
+	if _, err := s.Store.SettlePerformanceStatuses(ctx, teamID); err != nil {
+		return stats, err
+	}
+	rows, err := s.Store.QueryMaps(ctx, `
+		SELECT COUNT(*) FILTER (WHERE booking_status='筹备中') AS preparing_count,
+		       COUNT(*) FILTER (WHERE booking_status='预热中') AS warming_up_count,
+		       COUNT(*) FILTER (WHERE booking_status='已演出') AS played_count,
+		       COUNT(*) FILTER (WHERE booking_status='已取消') AS canceled_count,
+		       MIN(starts_at) FILTER (WHERE starts_at >= LOCALTIMESTAMP AND booking_status <> '已取消') AS next_starts_at
+		FROM performance_booking WHERE team_id=$1`, teamID)
+	if err != nil {
+		return stats, err
+	}
+	if len(rows) > 0 {
+		row := rows[0]
+		stats.PreparingCount = intField(row, "preparing_count")
+		stats.WarmingUpCount = intField(row, "warming_up_count")
+		stats.PlayedCount = intField(row, "played_count")
+		stats.CanceledCount = intField(row, "canceled_count")
+		if nextAt, ok := timeField(row, "next_starts_at"); ok {
+			now := time.Now()
+			today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+			nextDay := time.Date(nextAt.Year(), nextAt.Month(), nextAt.Day(), 0, 0, 0, 0, nextAt.Location())
+			days := int(nextDay.Sub(today).Hours() / 24)
+			stats.NextStartsAt = nextAt.Format(time.RFC3339)
+			stats.NextDaysToStart = &days
+		}
+	}
+	promo, err := s.Store.QueryMaps(ctx, `
+		SELECT COUNT(DISTINCT c.performance_id) AS linked_performance_count,
+		       COUNT(*) FILTER (WHERE c.lifecycle='未发布') AS unpublished_promo_count,
+		       COUNT(*) AS plan_total,
+		       COUNT(*) FILTER (WHERE EXISTS (
+		           SELECT 1 FROM schedule s
+		           WHERE s.team_id=c.team_id AND s.content_id=c.id AND s.status='待发布'
+		       )) AS planned_count
+		FROM content c WHERE c.team_id=$1 AND c.performance_id IS NOT NULL`, teamID)
+	if err != nil {
+		return stats, err
+	}
+	if len(promo) > 0 {
+		row := promo[0]
+		stats.LinkedPerformanceCount = intField(row, "linked_performance_count")
+		stats.UnpublishedPromoCount = intField(row, "unpublished_promo_count")
+		stats.PlanTotal = intField(row, "plan_total")
+		stats.PlannedCount = intField(row, "planned_count")
+		if stats.PlanTotal > 0 {
+			rate := roundTo(100*float64(stats.PlannedCount)/float64(stats.PlanTotal), 2)
+			stats.ScheduleCompletionRate = &rate
+		}
+	}
+	return stats, nil
 }
 
 // rankTopContents computes the composite score in Go so the numeric type of the
@@ -1930,7 +2393,14 @@ func (s *Server) schedule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 422, "invalid_date", "结束日期格式无效")
 		return
 	}
-	items, err := s.Store.ListSchedules(r.Context(), claimsFrom(r).TeamID, start, end)
+	teamID := claimsFrom(r).TeamID
+	var items []map[string]any
+	var err error
+	if performanceID := strings.TrimSpace(r.URL.Query().Get("performance_id")); performanceID != "" {
+		items, err = s.Store.ListSchedulesByPerformance(r.Context(), teamID, performanceID, start, end)
+	} else {
+		items, err = s.Store.ListSchedules(r.Context(), teamID, start, end)
+	}
 	if err != nil {
 		writeError(w, r, 500, "schedule_failed", "读取排期日历失败")
 		return
@@ -2172,9 +2642,22 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	before, err := s.Store.QueryMaps(r.Context(), `SELECT s.*, CASE WHEN s.source='manual' THEN '用户手动' ELSE '系统自动' END AS source_label FROM schedule s WHERE s.id=$1 AND s.team_id=$2`, scheduleID, c.TeamID)
+	if err != nil || len(before) == 0 {
+		notFoundOrError(w, r, err, "排期不存在或更新失败")
+		return
+	}
+	// A manual edit is persisted as such: the plan stops being reported as
+	// machine-generated and the previous values are kept for later analysis.
+	fields["source"] = "manual"
 	item, err := s.Store.UpdateSchedule(r.Context(), c.TeamID, scheduleID, fields)
 	if err != nil {
 		notFoundOrError(w, r, err, "排期不存在或更新失败")
+		return
+	}
+	beforeRow := repository.NormalizeScheduleRows(before)[0]
+	if err = s.Store.LogScheduleAdjustment(r.Context(), c.TeamID, c.Name, scheduleID, describeScheduleRow(beforeRow), describeScheduleRow(item)); err != nil {
+		writeError(w, r, 500, "schedule_audit_failed", "记录排期调整失败")
 		return
 	}
 	writeJSON(w, 200, item)
@@ -2232,6 +2715,11 @@ func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request)
 	// workflow state is filtered out in the query, so the rule cannot be bypassed
 	// by the client.
 	rows, err := s.Store.QueryMaps(r.Context(), `SELECT id,title,category,platform,owner,lifecycle,workflow_state FROM content WHERE team_id=$1 AND lifecycle='未发布' AND workflow_state='待排期' AND NOT EXISTS (SELECT 1 FROM schedule WHERE schedule.team_id=content.team_id AND schedule.content_id=content.id AND schedule.status='待发布') ORDER BY created_at`, c.TeamID)
+	if performanceID := strings.TrimSpace(r.URL.Query().Get("performance_id")); performanceID != "" {
+		// Optional show filter: the suggestion page can be scoped to one 正式演出
+		// while still using this same generation path.
+		rows, err = s.Store.QueryMaps(r.Context(), `SELECT id,title,category,platform,owner,lifecycle,workflow_state FROM content WHERE team_id=$1 AND performance_id=$2 AND lifecycle='未发布' AND workflow_state='待排期' AND NOT EXISTS (SELECT 1 FROM schedule WHERE schedule.team_id=content.team_id AND schedule.content_id=content.id AND schedule.status='待发布') ORDER BY created_at`, c.TeamID, performanceID)
+	}
 	if err != nil {
 		writeError(w, r, 500, "candidate_query_failed", "读取待排期内容失败")
 		return

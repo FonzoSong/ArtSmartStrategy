@@ -149,10 +149,13 @@ CREATE TABLE IF NOT EXISTS performance_booking (
 	venue VARCHAR(200) NOT NULL, 
 	starts_at TIMESTAMP WITHOUT TIME ZONE NOT NULL, 
 	booking_status VARCHAR(30) NOT NULL, 
+	performance_type VARCHAR(60) NOT NULL DEFAULT '', 
+	ticket_link TEXT NOT NULL DEFAULT '', 
 	owner_user_id INTEGER, 
 	notes TEXT NOT NULL, 
 	created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL, 
 	PRIMARY KEY (id), 
+	CONSTRAINT ck_performance_booking_status CHECK (booking_status IN ('筹备中', '预热中', '已演出', '已取消')), 
 	FOREIGN KEY(team_id) REFERENCES team (id), 
 	FOREIGN KEY(owner_user_id) REFERENCES user_account (id)
 );
@@ -318,6 +321,8 @@ CREATE INDEX IF NOT EXISTS ix_performance_booking_owner_user_id ON performance_b
 CREATE INDEX IF NOT EXISTS ix_performance_booking_starts_at ON performance_booking (starts_at);
 
 CREATE INDEX IF NOT EXISTS ix_performance_booking_team_id ON performance_booking (team_id);
+
+CREATE INDEX IF NOT EXISTS ix_performance_booking_team_starts_at ON performance_booking (team_id, starts_at);
 
 CREATE INDEX IF NOT EXISTS ix_tag_team_id ON tag (team_id);
 

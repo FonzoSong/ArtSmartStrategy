@@ -227,11 +227,6 @@ func (r *Postgres) ListTeamRows(
 	return rows, nil
 }
 
-// ListPerformances returns current-team performance bookings with owner labels.
-func (r *Postgres) ListPerformances(ctx context.Context, teamID int64) ([]map[string]any, error) {
-	return r.ListTeamRows(ctx, `SELECT p.*,u.name AS owner_name FROM performance_booking p LEFT JOIN user_account u ON u.id=p.owner_user_id WHERE p.team_id=$1 ORDER BY p.starts_at`, teamID)
-}
-
 // ListTags returns team tags with usage counts and creator display names.
 func (r *Postgres) ListTags(ctx context.Context, teamID int64) ([]map[string]any, error) {
 	return r.ListTeamRows(ctx, `SELECT t.id,t.name,t.color,t.is_active AS active,t.created_at,u.name AS created_by,COUNT(ct.content_id) AS count FROM tag t LEFT JOIN user_account u ON u.id=t.created_by_user_id LEFT JOIN content_tag ct ON ct.tag_id=t.id WHERE t.team_id=$1 GROUP BY t.id,u.name ORDER BY t.name`, teamID)
@@ -254,38 +249,4 @@ func (r *Postgres) CreateTag(ctx context.Context, teamID, actorID int64, name st
 		return nil, err
 	}
 	return rows[0], nil
-}
-
-// CreatePerformanceBooking records a team-owned performance and its audit row.
-func (r *Postgres) CreatePerformanceBooking(ctx context.Context, teamID, actorID int64, actor string, input domain.Performance) (map[string]any, error) {
-	if strings.TrimSpace(input.Title) == "" || input.StartsAt.IsZero() {
-		return nil, errors.New("演出名称和开始时间为必填项")
-	}
-	if input.ID == "" {
-		input.ID = newUUID()
-	}
-	tx, err := r.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if input.OwnerUserID != nil {
-		if err = tx.QueryRowContext(ctx, `SELECT name FROM user_account WHERE id=$1 AND team_id=$2`, *input.OwnerUserID, teamID).Scan(&input.Owner); err != nil {
-			return nil, errors.New("负责人不存在或不属于当前团队")
-		}
-	}
-	if input.BookingStatus == "" {
-		input.BookingStatus = "已预订"
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO performance_booking (id,team_id,title,venue,starts_at,booking_status,owner_user_id,notes,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())`, input.ID, teamID, input.Title, input.Venue, input.StartsAt, input.BookingStatus, input.OwnerUserID, input.Notes)
-	if err != nil {
-		return nil, err
-	}
-	if err = insertAudit(ctx, tx, teamID, actor, "create", "performance", input.ID, input.Title); err != nil {
-		return nil, err
-	}
-	if err = tx.Commit(); err != nil {
-		return nil, err
-	}
-	return map[string]any{"id": input.ID, "team_id": teamID, "title": input.Title, "venue": input.Venue, "starts_at": input.StartsAt, "booking_status": input.BookingStatus, "owner_user_id": input.OwnerUserID, "owner": input.Owner, "notes": input.Notes}, nil
 }

@@ -4,6 +4,7 @@ services:
   db:
     image: postgres:16-alpine
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       POSTGRES_DB: ${POSTGRES_DB:-arts_smart}
       POSTGRES_USER: ${POSTGRES_ADMIN_USER:-arts_admin}
       POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-${POSTGRES_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD in .env}}
@@ -33,6 +34,7 @@ services:
       dockerfile: Dockerfile
     environment:
       API_ADDR: ":8080"
+      TZ: ${TZ:-Asia/Shanghai}
       DATABASE_URL: postgresql://${APP_DB_USER:-arts_app}:${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env}@db:5432/${POSTGRES_DB:-arts_smart}?sslmode=disable
       APP_SECRET: ${APP_SECRET:?Set APP_SECRET in .env}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost,http://127.0.0.1,http://localhost:5173}
