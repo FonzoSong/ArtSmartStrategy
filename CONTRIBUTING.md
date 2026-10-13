@@ -12,7 +12,10 @@ set the secret values, then start the services:
 docker compose up --build
 ```
 
-On Windows, run `start.bat`; it starts the same Compose services.
+On Windows, `start-docker.bat` starts the same Compose services. To develop only
+the frontend without Docker, run `start.bat` (it delegates to `web/start.bat`),
+which starts the Vite dev server against the backend in `web/.env` and opens the
+browser.
 
 ## Checks
 

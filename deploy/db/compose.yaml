@@ -10,7 +10,7 @@ services:
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD}
       LOAD_EXAMPLE_DATA: ${LOAD_EXAMPLE_DATA:-false}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - ./pgdata:/var/lib/postgresql/data
       - ../../db/init:/docker-entrypoint-initdb.d:ro
       - ../../db/sql:/docker-entrypoint-sql:ro
     ports:

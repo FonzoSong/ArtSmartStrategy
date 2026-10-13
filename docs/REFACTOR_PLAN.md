@@ -6,7 +6,9 @@
 - 数据层：PostgreSQL，使用版本化 SQL 迁移和团队隔离查询。
 - 前端：独立 Vite/TypeScript 应用，通过 API 访问业务数据。
 - 历史数据：工作区原 SQLite 含 13 条内容、2 个团队、2 个用户、3 个会话、3 条排期、2 条推荐、8 条审计日志、1 个模型配置和 1 个分析基准；已导入 PostgreSQL 命名卷并按行数核验，随后删除本地数据文件。
-- 部署：Compose 管理 Web、Go API 和 PostgreSQL；`start.bat` 调用 Compose，不启动旧 Python 服务。
+- 部署：Compose 管理 Web、Go API 和 PostgreSQL，`start-docker.bat` 调用 Compose；根目录
+  `start.bat` 只启动前端开发服务器（不依赖 Docker），后端地址由 `web/.env` 决定；两者都
+  不启动旧 Python 服务。
 
 ## 目标目录与边界
 

@@ -1,41 +1,42 @@
 @echo off
+rem ============================================================================
+rem  艺数智策 · 一键启动前端（Windows，不需要 Docker）
+rem
+rem  作用：启动前端开发服务器，就绪后用默认浏览器打开页面；日志留在当前窗口。
+rem        后端地址来自 web\.env：VITE_DEV_API_TARGET（默认 http://59.110.90.28:8080）
+rem        是开发服务器 /api 的代理目标；浏览器只访问同源 /api，不涉及跨域。
+rem  实现：直接调用 web\start.bat —— 环境检查、按需安装依赖、启动、就绪检测只有一份。
+rem  不涉及：Docker、数据库、Go 后端进程。需要整套本机服务时改用 start-docker.bat。
+rem  退出码（与 web\start.bat 一致）：1 缺少 Node/npm；2 依赖安装失败；3 缺少 package.json；
+rem          4 缺少 .env 且无法创建；5 .env 配置错误；6 开发服务器启动失败。
+rem ============================================================================
 setlocal
 cd /d "%~dp0"
 
-where docker >nul 2>nul
-if errorlevel 1 (
-  echo Docker Desktop is required. Install or start Docker Desktop first.
+if not exist "web\start.bat" (
+  echo [错误] 未找到 web\start.bat，无法启动前端。
+  echo        请确认在完整的项目目录中运行本脚本（前端代码位于 web 子目录）。
+  endlocal
   exit /b 3
 )
 
-docker compose version >nul 2>nul
+where node >nul 2>nul
 if errorlevel 1 (
-  echo Docker Compose v2 is required. Update Docker Desktop and try again.
-  exit /b 3
+  echo [错误] 未检测到 Node.js。请安装 Node.js 20 或更高版本，并确保 node 已加入 PATH。
+  echo        安装后请重新打开命令行再运行本脚本。
+  endlocal
+  exit /b 1
 )
 
-if not exist ".env" (
-  copy ".env.example" ".env" >nul
-  echo Created .env from .env.example.
-  echo Set POSTGRES_ADMIN_PASSWORD, APP_DB_PASSWORD, and APP_SECRET in .env.
-  exit /b 2
-)
+echo.
+echo === 艺数智策 · 一键启动前端（不使用 Docker）===
+echo 后端地址来自 web\.env，由开发服务器代理 /api；就绪后自动打开浏览器。
+echo.
 
-docker compose config --quiet
-if errorlevel 1 (
-  echo Compose configuration is incomplete. Check required values in .env.
-  exit /b 4
+call "%~dp0web\start.bat"
+set "FRONTEND_EXIT=%ERRORLEVEL%"
+if not "%FRONTEND_EXIT%"=="0" (
+  echo.
+  echo [错误] 前端启动流程未正常完成（退出码 %FRONTEND_EXIT%），原因见上面的输出。
 )
-
-docker compose up --build --detach --wait
-set "START_RESULT=%ERRORLEVEL%"
-if not "%START_RESULT%"=="0" (
-  echo Startup failed. Recent service logs follow.
-  docker compose ps
-  docker compose logs --tail=80 db api web
-  exit /b %START_RESULT%
-)
-
-echo ArtSmart is ready at http://localhost/ and http://127.0.0.1/ by default.
-echo API health is available at http://localhost/api/health/ready.
-endlocal
+endlocal & exit /b %FRONTEND_EXIT%

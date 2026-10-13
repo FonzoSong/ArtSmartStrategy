@@ -4,6 +4,9 @@ rem  艺数智策 · 前端一键启动（Windows 非 Docker 环境）
 rem
 rem  职责：检查环境、安装缺失依赖、启动 Vite 开发服务器、等待真正就绪后
 rem        打开默认浏览器。日志留在当前窗口。
+rem  后端地址：来自 web\.env。VITE_DEV_API_TARGET 是开发服务器 /api 的代理目标
+rem            （当前默认 http://59.110.90.28:8080）；VITE_API_BASE_URL 留空表示
+rem            浏览器只访问同源 /api，由开发服务器转发，不触发跨域。
 rem  边界：不启动/停止 Go 后端，不初始化或迁移数据库，不依赖 Docker，
 rem        不覆盖已有 .env，不删除任何数据。
 rem  退出码：0 成功（开发服务器正常退出）；1 缺少 Node/npm；2 依赖安装失败；
@@ -102,7 +105,7 @@ if defined DEV_TARGET (
 )
 if defined DEV_TARGET (
   echo        开发代理目标 VITE_DEV_API_TARGET=!DEV_TARGET!
-  echo        若该地址包含容器内部服务名，请改为本机可达的地址。
+  echo        即页面上的 /api 请求都会由本机开发服务器转发到这里。
 ) else (
   echo        开发代理目标 VITE_DEV_API_TARGET 未设置：默认代理到 http://localhost:8080
 )
@@ -126,8 +129,34 @@ if defined API_BASE (
     endlocal
     exit /b 5
   )
+  rem 非空表示浏览器直连后端：后端必须允许本页面来源跨域（CORS_ALLOWED_ORIGINS），
+  rem 否则接口会返回 403 跨域来源未获允许。远端后端通常没有开放跨域，所以推荐留空。
+  echo        [提示] 该值非空表示浏览器直连后端，需要后端 CORS_ALLOWED_ORIGINS
+  echo               允许本页面来源（默认 http://localhost:5173）；
+  echo               若接口返回 403 跨域来源未获允许，请把它留空并改用
+  echo               VITE_DEV_API_TARGET，由开发服务器代理转发。
 ) else (
-  echo        VITE_API_BASE_URL 为空：使用同源 /api（推荐，需后端在 http://localhost:8080 运行）
+  echo        VITE_API_BASE_URL 为空：浏览器只访问同源 /api，由开发服务器代理转发，不跨域
+)
+
+rem --- 4b. 后端连通性提示（只提示，不阻塞启动） ------------------------------
+rem 页面本身不依赖后端也能打开，但如果后端不可达，所有接口都会失败。这里先用一次
+rem TCP 连接探测（最多 3 秒），把原因直接打印在启动日志里，便于排查。
+if defined DEV_TARGET (
+  set "PROBE_URL=!DEV_TARGET!"
+) else (
+  set "PROBE_URL=http://localhost:8080"
+)
+rem 裸 host:port（缺少 http://）由 vite.config.ts 规范化，这里补上以便解析。
+if not "!PROBE_URL:~0,4!"=="http" set "PROBE_URL=http://!PROBE_URL!"
+set "PROBE_PS=try{$u=[uri]'!PROBE_URL!';$c=New-Object Net.Sockets.TcpClient;$a=$c.BeginConnect($u.Host,$u.Port,$null,$null);if($a.AsyncWaitHandle.WaitOne(3000)){$c.EndConnect($a);exit 0}}catch{};exit 1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "!PROBE_PS!" >nul 2>nul
+if errorlevel 1 (
+  echo [提示] 后端 !PROBE_URL! 当前无法连接。页面仍会打开，但接口请求会失败。
+  echo        请确认后端已启动、本机网络/VPN 能访问该地址，或修改 web\.env 的
+  echo        VITE_DEV_API_TARGET 指向可达的后端后重新运行本脚本。
+) else (
+  echo        后端连通性正常：!PROBE_URL!
 )
 
 rem --- 5. 选择可用端口 -------------------------------------------------------
@@ -152,11 +181,14 @@ if not defined PORT (
   exit /b 6
 )
 set "APP_URL=http://localhost:%PORT%/"
+rem 探测用 IPv4 回环：开发服务器绑定 0.0.0.0（仅 IPv4），而 Windows 上 localhost 可能先
+rem 解析到 ::1，用 localhost 探测会白等一轮。浏览器仍然打开 http://localhost:端口/。
+set "POLL_URL=http://127.0.0.1:%PORT%/"
 echo [4/5] 使用端口 %PORT%
 
 rem --- 6. 启动前先把"就绪检测"放到后台窗口 -----------------------------------
 rem 检测到 HTTP 服务真正可用后才打开默认浏览器，避免出现空白页。
-set "WAIT_PS=$u='%APP_URL%';for($i=0;$i -lt 90;$i++){try{$r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri $u;if($r.StatusCode -ge 200){Start-Process $u;exit 0}}catch{};Start-Sleep -Seconds 1};exit 1"
+set "WAIT_PS=$u='%APP_URL%';$p='%POLL_URL%';for($i=0;$i -lt 90;$i++){try{$r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri $p;if($r.StatusCode -ge 200){Start-Process $u;exit 0}}catch{};Start-Sleep -Seconds 1};exit 1"
 start "ArtSmart 前端就绪检测" /min powershell -NoProfile -ExecutionPolicy Bypass -Command "!WAIT_PS!"
 
 rem --- 7. 在当前窗口启动开发服务器（日志可见） -------------------------------

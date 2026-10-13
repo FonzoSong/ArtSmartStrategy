@@ -32,9 +32,10 @@ docker compose ps
 docker compose logs -f api
 ```
 
-Windows 可运行 `start.bat`，其执行相同的 Docker Compose 启动流程。Web 监听本机 80 端口，
-可通过 `http://localhost/` 或 `http://127.0.0.1/` 访问；API 经同源 `/api` 代理访问。PostgreSQL 使用 `db` 服务名，
-仅加入内部 `db-net`，没有宿主机端口映射。API 运行账号是非超级用户。
+Windows 可运行 `start-docker.bat`，其执行相同的 Docker Compose 启动流程。Web 监听本机 80
+端口，可通过 `http://localhost/` 或 `http://127.0.0.1/` 访问；API 经同源 `/api` 代理访问。PostgreSQL 使用 `db` 服务名，
+仅加入内部 `db-net`，没有宿主机端口映射。API 运行账号是非超级用户。只做前端时用根目录的
+`start.bat`，它不需要 Docker（见「本机开发」）。
 
 `LOAD_EXAMPLE_DATA=true` 仅控制数据库第一次初始化时是否执行
 `db/sql/02_seed_data.sql`。新环境默认导入虚构样例；现有数据库卷不会再次执行初始化脚本。
@@ -81,10 +82,14 @@ npm ci
 npm run dev
 ```
 
-Windows 也可直接双击 [web/start.bat](web/start.bat)：它会检查 Node/npm 与依赖、在缺失时
-安装、启动开发服务器、等待服务真正就绪后打开浏览器，并在失败时给出明确原因。若后端不是
-本机 8080（例如只在 Compose 中运行），先把 `web/.env` 的 `VITE_DEV_API_TARGET` 指向本机可达
-的地址（例如 `http://localhost`）。前端环境变量说明见 [web/README.md](web/README.md)。
+Windows 可直接双击根目录的 `start.bat`（内部调用 [web/start.bat](web/start.bat)，不需要
+Docker）：它会检查 Node/npm 与依赖、在缺失时安装、启动开发服务器、等待服务真正就绪后打开
+浏览器，并在失败时给出明确原因。若后端不是
+本机 8080，把 `web/.env` 的 `VITE_DEV_API_TARGET` 指向它即可：本仓库默认已指向远端后端
+`http://59.110.90.28:8080`（本机运行 Go API 时改回 `http://localhost:8080`，只经 Compose
+的 Nginx 访问时填 `http://localhost`）。`VITE_API_BASE_URL` 保持留空：浏览器只访问同源
+`/api`，由开发服务器代理转发，不触发跨域（远端后端未开放任何浏览器跨域来源）。前端环境
+变量说明见 [web/README.md](web/README.md)。
 
 ## 数据库维护
 

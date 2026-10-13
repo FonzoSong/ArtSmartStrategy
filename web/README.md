@@ -106,7 +106,7 @@ web/
 | 变量 | 用途 | 示例值 | 是否必填 | 改动后 |
 | --- | --- | --- | --- | --- |
 | `VITE_API_BASE_URL` | 浏览器访问后端的地址；留空表示同源 `/api` | 空（推荐）；或 `http://localhost:8080`；或 `https://arts.example.com` | 否（留空即可） | 需要重启开发服务器（Vite 只在启动时读取 env） |
-| `VITE_DEV_API_TARGET` | 仅开发环境：Vite 的 `/api` 代理目标 | `http://localhost:8080`（默认）；Compose 里只有 API 时填 `http://localhost` | 否 | 需要重启开发服务器 |
+| `VITE_DEV_API_TARGET` | 仅开发环境：Vite 的 `/api` 代理目标（后端地址写在这里）。裸 `host:port` 会被自动补成 `http://host:port` | `http://59.110.90.28:8080`（本仓库默认，后端在远端）；本机后端填 `http://localhost:8080`；Compose 里只有 API 时填 `http://localhost` | 否 | 需要重启开发服务器 |
 
 说明：
 
@@ -118,11 +118,16 @@ web/
 - 如果确实要跨域直连后端（例如后端在另一台主机），填写完整来源（含协议与端口），并在后端
   `CORS_ALLOWED_ORIGINS` 中登记前端来源。`lib/apiBase.ts` 会把裸 `host:port` 规范化成
   `http://host:port`，让配置错误立刻可见，而不是变成相对路径。
+- **远端后端目前未开放任何浏览器跨域来源**：`http://59.110.90.28:8080` 对带 `Origin` 的
+  请求一律返回 `403 跨域来源未获允许`（`origin_forbidden`），`http://localhost:5173` 也不例外。
+  所以指向该后端时必须留空 `VITE_API_BASE_URL`，由开发服务器（或生产 Nginx）代理 `/api`；
+  后端地址只写在 `VITE_DEV_API_TARGET`。
 
 ### 本地运行与 Docker 的差异
 
 | 场景 | `VITE_API_BASE_URL` | `/api` 如何到达后端 |
 | --- | --- | --- |
+| 本机开发（后端在远端，本仓库默认） | 留空 | Vite 代理：`/api` → `VITE_DEV_API_TARGET`（`http://59.110.90.28:8080`） |
 | 本机开发（非 Docker，本机跑 Go API） | 留空 | Vite 代理：`/api` → `VITE_DEV_API_TARGET`（默认 `http://localhost:8080`） |
 | 本机开发（API 只在 Compose 里） | 留空 | 把 `VITE_DEV_API_TARGET` 设为 `http://localhost`（Compose Web 入口的 Nginx 会继续转发给 API） |
 | 本机开发（直连后端） | `http://localhost:8080` | 浏览器直连；后端 `CORS_ALLOWED_ORIGINS` 需包含 `http://localhost:5173` |
@@ -133,6 +138,7 @@ web/
 
 ### 方式一：双击 `start.bat`（推荐）
 
+双击 `web/start.bat`，或项目根目录的 `start.bat`（它直接调用前者）。两者都不需要 Docker。
 见第 6 节，脚本会检查环境、启动开发服务器、等待就绪并打开浏览器。
 
 ### 方式二：手动执行
@@ -155,7 +161,11 @@ Vite 的 `/api` 代理（此时浏览器只与 5173 通信，不触发跨域）�
 
 ### 修改后端地址
 
-编辑 `web/.env` 中的 `VITE_API_BASE_URL` 后**重启** `npm run dev`；只改文件不重启不会生效。
+后端地址只写在 `web/.env` 的 `VITE_DEV_API_TARGET`（本仓库默认
+`http://59.110.90.28:8080`），`VITE_API_BASE_URL` 保持留空表示同源访问。改完必须**重启**
+`npm run dev`（或重新运行 `start.bat`）：Vite 只在启动时读取 env，只改文件不重启不会生效。
+值可以是完整 URL，也可以只写 `host:port`——缺协议时 `vite.config.ts` 会补上 `http://`，
+避免代理在第一个 `/api` 请求上抛出难懂的错误。
 
 ### 类型检查与生产构建
 
@@ -168,13 +178,15 @@ npm run build       # 产出 web/dist/
 ### 前后端连通性验证
 
 ```text
-curl http://localhost:8080/api/health/live    # 后端存活
-curl http://localhost:8080/api/health/ready   # 数据库连通
-curl http://localhost:5173/                   # 前端入口
-curl http://localhost:5173/api/health/ready   # 经 Vite 代理访问后端
+curl http://59.110.90.28:8080/api/health/live  # 后端存活（远端）
+curl http://59.110.90.28:8080/api/health/ready # 数据库连通（远端）
+curl http://localhost:5173/                    # 前端入口
+curl http://localhost:5173/api/health/ready    # 经 Vite 代理访问后端（应与上一条一致）
 ```
 
 打开页面后按 F12，Network 中应看到 `/api/...` 请求返回 200；Console 不应出现未捕获异常。
+未登录时 `/api/contents` 等接口返回后端自己的 `401 {"detail":"请先登录"}`，这也是代理正常
+的证据——说明响应来自后端而不是代理错误页。
 
 ## 6. `start.bat` 启动流程
 
@@ -184,9 +196,12 @@ curl http://localhost:5173/api/health/ready   # 经 Vite 代理访问后端
 2. 检查 `node` 与 `npm` 是否存在。
 3. 若 `node_modules` 不存在则执行一次 `npm ci`（存在则跳过，不会无条件重装）。
 4. 若 `.env` 不存在，从 `.env.example` 复制一份（已存在则绝不覆盖）。
-5. 使用 `npm run dev` 启动前端，日志留在当前窗口。
-6. 轮询等待前端真正就绪（最多约 90 秒）后，用默认浏览器打开实际端口地址。
-7. 失败时给出明确原因（缺依赖、端口被占用、准备超时）并返回非零退出码。
+5. 读取 `.env` 并打印实际生效的后端地址：`VITE_DEV_API_TARGET` 是 `/api` 的代理目标；
+   若 `VITE_API_BASE_URL` 非空则提示跨域前提（后端必须允许该来源）；随后用一次最长 3 秒的
+   TCP 探测报告后端是否可达——不可达只提示，不阻止启动。
+6. 使用 `npm run dev` 启动前端，日志留在当前窗口。
+7. 轮询等待前端真正就绪（最多约 90 秒）后，用默认浏览器打开实际端口地址。
+8. 失败时给出明确原因（缺依赖、端口被占用、准备超时）并返回非零退出码。
 
 边界：它**不**启动或停止 Go 后端，**不**初始化或迁移数据库，**不**依赖 Docker/Compose，
 也**不**会删除数据库数据。端口可通过 `WEB_DEV_PORT` 指定（默认 5173）。
@@ -197,9 +212,10 @@ curl http://localhost:5173/api/health/ready   # 经 Vite 代理访问后端
 | --- | --- | --- |
 | `node 不是内部或外部命令` | 未安装 Node.js 或未加入 PATH | 安装 Node.js 20+ 并重新打开命令行 |
 | `vite` 启动失败、提示端口被占用 | 5173 已被其他进程占用 | 结束占用进程，或设置 `WEB_DEV_PORT=5174` 后重新运行 `start.bat` |
-| 页面能打开但接口全 404/红色错误 | 后端未启动，或 `VITE_API_BASE_URL` 指向了错误地址 | 先 `curl http://localhost:8080/api/health/live`；确认 `web/.env` 留空或指向正确主机，改后重启 dev server |
+| 页面能打开但接口全 404/红色错误 | 后端未启动，或 `VITE_API_BASE_URL`/`VITE_DEV_API_TARGET` 指向了错误地址 | 先 `curl http://59.110.90.28:8080/api/health/live`（或后端实际地址）；确认 `web/.env` 的 `VITE_API_BASE_URL` 留空、`VITE_DEV_API_TARGET` 指向正确主机，改后重启 dev server |
 | 开发时 `/api/...` 返回 500 | Vite 代理目标不可达（默认 `http://localhost:8080`，但后端只在容器里） | 在 `web/.env` 设 `VITE_DEV_API_TARGET=http://localhost`（或后端实际地址）后重启 dev server |
-| 浏览器报跨域错误 | 填写了完整的 `VITE_API_BASE_URL`，但后端未允许该来源 | 在后端 `CORS_ALLOWED_ORIGINS` 加入前端来源；或改为留空以使用同源代理 |
+| 浏览器报跨域错误，接口返回 `403 跨域来源未获允许` | 填写了完整的 `VITE_API_BASE_URL`，但后端未允许该来源（远端后端默认拒绝所有来源） | 把 `web/.env` 的 `VITE_API_BASE_URL` 留空，改用 `VITE_DEV_API_TARGET` 指向后端后重启 dev server；或在后端 `CORS_ALLOWED_ORIGINS` 登记前端来源 |
+| 启动窗口提示"后端 当前无法连接" | 本机网络/防火墙/VPN 无法到达 `VITE_DEV_API_TARGET` | 页面仍可使用，但接口会失败；确认后端已启动、地址与端口正确，能 `curl` 通后重新运行 `start.bat` |
 | 依赖安装失败 | 网络或缓存问题 | 删除 `node_modules` 后重新 `npm ci`；企业网络需配置 npm registry 代理 |
 | 修改 `.env` 没有效果 | Vite 只在启动时读取环境变量 | 重启 `npm run dev` |
 | 登录后立刻 401 | 会话已过期或被吊销 | 重新登录；确认后端 `APP_SECRET` 未更换 |

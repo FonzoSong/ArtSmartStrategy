@@ -93,6 +93,18 @@ Notable project changes are recorded here.
   tops a team up to 120 example content records (marked `source='example'`), so a
   freshly created team can be inspected with realistic data volume without
   touching existing rows, accounts, shows or plans.
+- Point the browser at the remote backend through the dev server: `web/.env` and
+  `web/.env.example` set `VITE_DEV_API_TARGET=http://59.110.90.28:8080` and keep
+  `VITE_API_BASE_URL` empty, because the deployed API answers `403 跨域来源未获允许`
+  to every cross-origin browser request. A bare `host:port` in
+  `VITE_DEV_API_TARGET` is normalized to `http://host:port` instead of failing
+  inside the proxy, and `start.bat` prints the effective backend address and
+  probes it with a 3-second TCP check before opening the browser.
+- Make the root `start.bat` Docker-free: it now starts the frontend only (it
+  delegates to `web/start.bat`, so the checks and the browser opening exist once)
+  and needs neither Docker nor a local backend. The previous Docker Compose
+  launcher moved to `start-docker.bat` unchanged, and the README, CONTRIBUTING and
+  refactor-plan references were updated.
 
 # v0.4.0
 
