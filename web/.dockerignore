@@ -1,0 +1,8 @@
+# Keep the image build context to the sources it actually needs: dependencies and
+# a previous dist are rebuilt inside the image, and a local .env must never leak
+# into a published frontend bundle (the Dockerfile passes VITE_API_BASE_URL).
+node_modules
+dist
+.env
+.env.*
+*.log

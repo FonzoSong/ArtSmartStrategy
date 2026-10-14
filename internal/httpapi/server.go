@@ -26,6 +26,12 @@ import (
 
 type claimsKey struct{}
 
+// corsAllowedHeaders lists the request headers a browser may send after a
+// preflight. The web client always sends X-Team-Id, Authorization carries the
+// bearer token and Content-Type the JSON body, so a header missing from this
+// list makes the browser drop the request before it reaches the API.
+const corsAllowedHeaders = "Authorization, Content-Type, X-Team-Id"
+
 // Server binds authenticated business handlers to PostgreSQL repositories.
 type Server struct {
 	Config config.Config
@@ -164,7 +170,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			}
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", corsAllowedHeaders)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
 		}
 		if r.Method == http.MethodOptions {

@@ -4,6 +4,19 @@ Notable project changes are recorded here.
 
 ## Unreleased
 
+- Fix the standalone (three-server) frontend deployment: `deploy/web/compose.yaml`
+  builds the web image again instead of reusing a stale `artsmart-web:latest`, so
+  Nginx no longer starts with a baked-in upstream and fails with
+  `host not found in upstream "api"`. `API_UPSTREAM` from `deploy/web/.env` is
+  injected into the container and rendered into `/etc/nginx/conf.d/default.conf`
+  at start-up; the README documents the rebuild/recreate command.
+- Stop Nginx from forwarding the browser's `Origin` header to the API on the
+  same-origin `/api` hop, which made login and every save fail with
+  `403 跨域来源未获允许` when the frontend was reached through a host other than
+  the ones listed in the API's `CORS_ALLOWED_ORIGINS`.
+- List `X-Team-Id` in `Access-Control-Allow-Headers` so a genuine cross-origin
+  preflight (dev server or `VITE_API_BASE_URL` pointed straight at the API) no
+  longer blocks every request that carries the team header.
 - Add Go API and independent TypeScript/Vite frontend.
 - Add PostgreSQL migrations and an explicit SQLite history importer.
 - Update Docker Compose deployment and Go/Node CI checks.

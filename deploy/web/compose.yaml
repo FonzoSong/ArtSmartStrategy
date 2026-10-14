@@ -1,10 +1,15 @@
 services:
   web:
-    image: artsmart-web:0.4.0
+    image: artsmart-web:latest
+    # Build from this repository so the image carries the current nginx template.
+    # Reusing a pre-built image (for example a `latest` tag left over from an
+    # earlier release) is what makes Nginx fall back to a baked-in upstream and
+    # fail with `host not found in upstream "api"`.
     build:
       context: ../../web
       dockerfile: Dockerfile
       args:
+        # Empty keeps the browser on the page's own origin: Nginx proxies /api/.
         VITE_API_BASE_URL: ""
     environment:
       API_UPSTREAM: ${API_UPSTREAM:?Set API_UPSTREAM to the API private URL}

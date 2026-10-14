@@ -60,10 +60,29 @@ docker compose --env-file deploy/web/.env -f deploy/web/compose.yaml up --build 
 
 前端服务器需将 `WEB_BIND_ADDRESS` 设为可供用户或 TLS 反向代理访问的接口地址；本机测试
 设为 `127.0.0.1`。Web 服务器用 `API_UPSTREAM` 指定 API 地址（单机 Compose 默认
-`http://api:8080`，三服务器部署填 API 的私网地址），该值在容器启动时注入 Nginx。API 服务器
-`CORS_ALLOWED_ORIGINS` 填写 Web 的完整来源，否则浏览器发起的写请求（登录、保存）会返回
-`403 跨域来源未获允许`。数据库和 API 之间应使用私有网络或 VPN，并按示例限制防火墙来源；
-跨不可信网络部署需配置 PostgreSQL TLS 并在 `DATABASE_URL` 使用 `sslmode=require`。
+`http://api:8080`，三服务器部署填 API 的私网地址）。
+
+`API_UPSTREAM` 写在 `deploy/web/.env`（与 `compose.yaml` 同目录；Compose 会自动读取，命令
+里的 `--env-file` 只是把它写明确），由 Compose 以环境变量注入 Web 容器，Nginx 官方入口
+脚本在**容器启动时**用 `envsubst` 把 `${API_UPSTREAM}` 渲染进 `/etc/nginx/conf.d/default.conf`。
+因此只改 `.env` 不会让正在运行的容器生效，必须重建/重建容器；容器内可直接核对：
+
+```text
+docker compose --env-file deploy/web/.env -f deploy/web/compose.yaml up --build --detach --wait --force-recreate
+docker exec deploy-web-1 printenv API_UPSTREAM
+docker exec deploy-web-1 cat /etc/nginx/conf.d/default.conf
+```
+
+改动 `web/nginx.conf.template` 或 `web/Dockerfile` 后必须带 `--build`，否则会继续使用旧镜像
+（旧镜像里 Nginx 上游是写死的 `http://api:8080`，独立部署时会报
+`host not found in upstream "api"`）。
+
+浏览器只访问 Web 的同源 `/api`，由 Web 容器内的 Nginx 转发：这一跳不涉及跨域，Nginx 会去掉
+浏览器为 POST/PATCH/DELETE 附带的 `Origin`，避免 API 把同源写请求误判为跨域（登录、保存
+返回 `403 跨域来源未获允许`）。只有把浏览器直接指向 API 时（`VITE_API_BASE_URL` 填完整
+地址）才需要 API 服务器的 `CORS_ALLOWED_ORIGINS` 覆盖该来源；API 仍会拒绝未登记来源。
+数据库和 API 之间应使用私有网络或 VPN，并按示例限制防火墙来源；跨不可信网络部署需配置
+PostgreSQL TLS 并在 `DATABASE_URL` 使用 `sslmode=require`。
 
 ## 本机开发
 

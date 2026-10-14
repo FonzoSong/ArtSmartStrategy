@@ -21,6 +21,15 @@ server {
     location /api/ {
         proxy_pass ${API_UPSTREAM};
         proxy_http_version 1.1;
+        # The browser loads the page from this server, so the /api call is a
+        # same-origin request: browsers still tag POST/PATCH/DELETE with Origin,
+        # but CORS does not apply to it. Forwarding that tag makes the API answer
+        # 403 跨域来源未获允许 for every write (login, saving records) unless the
+        # operator also lists this web host in the API's CORS_ALLOWED_ORIGINS, so
+        # the proxy speaks to the API as a plain server-to-server client - the
+        # same thing the Vite dev proxy does. The API keeps enforcing its origin
+        # allowlist for direct cross-origin callers.
+        proxy_set_header Origin "";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
