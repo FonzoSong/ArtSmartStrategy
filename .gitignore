@@ -9,3 +9,4 @@ build/
 *.log
 *.csv
 NextVersion
+web/out/

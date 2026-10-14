@@ -1,0 +1,49 @@
+艺数智策 · 前端（web/out）
+============================================================
+
+这是什么
+  web/out 是 web/make.sh 生成的“自包含”前端产物：编译后的 JS、样式、
+  图片、以及一个只依赖 Node 内置模块的静态服务器。拷贝到任意 Windows
+  机器上都能运行，不需要 npm install、不需要 Docker、不需要 WSL。
+
+怎么启动（Windows）
+  1. 安装 Node.js 20 或更高版本（https://nodejs.org/），确保 node 在 PATH 里。
+  2. 双击本目录下的 start.bat。
+  3. 服务就绪后浏览器会自动打开 http://localhost:8080/ 。
+     端口 8080 被占用时会自动顺延到 8081、8082 …，实际地址打印在窗口里。
+  4. 停止服务：在窗口里按 Ctrl+C（脚本结尾有 pause，窗口不会闪退）。
+
+怎么启动（命令行 / 非 Windows）
+  cd 到本目录后执行：
+    node server.js                 # 默认 8080，自动顺延，自动开浏览器
+    node server.js --port 9000     # 指定起始端口
+    node server.js --no-open       # 不开浏览器（服务器/CI 场景）
+
+文件说明
+  index.html / assets/      编译后的页面与 JS、CSS（Vite 产物）
+  server.js                 静态服务器（零第三方依赖，仅 Node 内置模块）
+  start.bat                 Windows 双击启动脚本（内部调用 server.js）
+  api-target.txt            /api 的代理目标，可选，见下
+  package.json              仅用来把本目录固定为 CommonJS（删掉会让
+                            server.js 在 web/ 仓库内被当成 ES Module 而报错）
+
+关于后端 API（api-target.txt）
+  页面登录、录入等操作需要后端 API。api-target.txt 里填一行后端地址即可：
+    http://localhost:8080          后端跑在本机
+    http://59.110.90.28:8080       后端跑在远端
+  未填写（或整行被注释掉）时，/api 请求会返回 502，页面会提示“未配置后端 API”。
+  浏览器始终只访问本机同源地址，由 server.js 转发到后端，因此后端不需要配置
+  CORS；代理转发时会去掉 Origin 头，与 npm run dev 的 Vite 代理行为一致。
+  也可以在启动前设置环境变量覆盖它：set ARTSMART_API_TARGET=http://localhost:8080
+
+登录页的“一键添加测试账户”
+  登录页上的这个按钮仅用于开发/测试：它会调用后端注册接口创建测试账户
+  Test@tetst.com / STemENmtvgGArh4（邮箱拼写 tetst 是需求原文），并把邮箱
+  与密码回填到登录表单。账户已存在时按成功处理；后端不可达时退化为“仅回填
+  邮箱与密码”，并在按钮下方给出可读提示。
+  关闭方式：在 web/.env 中设置 VITE_ENABLE_TEST_ACCOUNT=false 后重新执行
+  web/make.sh 构建，按钮即不再出现在页面上。
+
+想重新构建
+  在源码目录 web/ 下执行：bash make.sh
+  （需要本机有 Node.js 与已安装的 node_modules：npm install）

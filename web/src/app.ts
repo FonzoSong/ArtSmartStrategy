@@ -893,7 +893,77 @@ async function teamPage(){
 }
 async function runRules(id){const contentId=id||state.records[0]?.id;if(!contentId){toast('没有可用于规则执行的内容记录');return}try{const out=await api('/api/rules/evaluate',{method:'POST',body:JSON.stringify({content_id:contentId})});await render();toast(`手动规则已检查 ${out.checked} 条，命中 ${out.matched} 条`)}catch(e){toast(e.message)}}
 function editBenchmark(b){showModal(`<h2>调整团队自身基准</h2><p>${escapeHtml(b.dataset.category)} · 手动基准会标注为团队调整值。</p><form id="benchmarkForm"><input type="hidden" name="category" value="${escapeHtml(b.dataset.category)}"/><div class="form-grid"><div class="form-field"><label>看完比例中位数（%）</label><input name="completion_median" type="number" min="0" max="100" step="0.1" required value="${escapeHtml(b.dataset.value||'0')}"/></div><div class="form-field"><label>互动比例中位数（%）</label><input name="interaction_median" type="number" min="0" step="0.1" required value="${escapeHtml(b.dataset.interaction||'0')}"/></div></div><div class="form-actions"><button type="button" class="btn-secondary" data-action="close">取消</button><button class="btn-primary">保存基准</button></div></form>`);qs('#benchmarkForm').onsubmit=async e=>{e.preventDefault();const d=Object.fromEntries(new FormData(e.currentTarget));d.completion_median=Number(d.completion_median);d.interaction_median=Number(d.interaction_median);try{await api('/api/benchmark',{method:'PUT',body:JSON.stringify(d)});closeModal();await render();toast('自身基准已更新')}catch(err){toast(err.message)}}}
-function authPage(setup=false){const isSetup=setup===true,isRegister=setup==='register-team',needsFields=isSetup||isRegister;document.body.classList.add('auth-mode');qs('#sidebar').classList.add('auth-hidden');qs('#crumb').textContent=needsFields?'创建团队':'账号登录';qs('#pageRoot').innerHTML=`<div class="auth-shell"><div class="eyebrow">ARTSMART STRATEGY</div><h1>${needsFields?'创建团队管理员':'登录艺数智策'}</h1><p>${needsFields?'设置团队与负责人账号，建立独立的私有数据空间。':'使用团队负责人提供的邮箱与密码登录。'}</p><form id="authForm" class="auth-form">${needsFields?`<label>团队名称<input name="team_name" required value="示例艺术团队"/></label><label>你的姓名<input name="name" required/></label>`:''}<label>邮箱<input name="email" type="email" required autocomplete="username"/></label><label>密码<input name="password" type="password" required minlength="10" autocomplete="${needsFields?'new-password':'current-password'}"/></label><div id="authError" class="auth-error"></div><button class="btn-primary">${needsFields?'创建账号并进入':'登录'}</button></form>${needsFields?'':'<button id="createTeamAccount" class="btn-secondary" style="margin-top:10px">创建新的团队空间</button>'}<p class="disclaimer">你的记录仅在当前团队空间内可见。建议部署在本机或团队内网。</p></div>`;qs('#authForm').onsubmit=async e=>{e.preventDefault();const d=Object.fromEntries(new FormData(e.currentTarget));try{const path=isSetup?'/api/auth/setup':isRegister?'/api/auth/register-team':'/api/auth/login';const res=await api(path,{method:'POST',body:JSON.stringify(d)});sessionStorage.setItem('artsSessionToken',res.access_token);state.user=res.user;state.teamId=res.user.team_id;localStorage.setItem('artsTeamId',state.teamId);document.body.classList.remove('auth-mode');qs('#sidebar').classList.remove('auth-hidden');syncPageChrome();await render();setIdentity();toast('登录成功')}catch(err){const message=qs('#authError');if(message)message.textContent=err.message;else toast(err.message)}};const create=qs('#createTeamAccount');if(create)create.onclick=()=>authPage('register-team')}
+// —— 测试账户（仅开发/测试使用，默认开启）------------------------------------
+// 邮箱按需求原文保留 “tetst” 拼写，不要改成 test。
+const TEST_ACCOUNT={email:'Test@tetst.com',password:'STemENmtvgGArh4',name:'测试账户',team:'测试艺术团队'};
+// 开关：在 web/.env 中设置 VITE_ENABLE_TEST_ACCOUNT=false（或 0/off/no/disabled）后重新构建，按钮即不再渲染。
+const TEST_ACCOUNT_ENABLED=(()=>{const raw=String(import.meta.env.VITE_ENABLE_TEST_ACCOUNT||'').trim().toLowerCase();return !['0','false','off','no','disabled'].includes(raw)})();
+
+function authFormError(message){const box=qs('#authError');if(box){box.textContent=message||'';return}toast(message)}
+function fillAuthForm(form,values){if(!form)return;for(const key of Object.keys(values)){const field=form.querySelector(`[name="${key}"]`);if(field)field.value=values[key]}}
+
+// 登录 / 创建团队共用同一段提交逻辑，登录页的测试账户按钮也复用它。
+async function submitAuthForm(form,mode={}){
+ const path=mode.isSetup?'/api/auth/setup':mode.isRegister?'/api/auth/register-team':'/api/auth/login';
+ const res=await api(path,{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(form)))});
+ sessionStorage.setItem('artsSessionToken',res.access_token);
+ state.user=res.user;state.teamId=res.user.team_id;localStorage.setItem('artsTeamId',state.teamId);
+ document.body.classList.remove('auth-mode');qs('#sidebar').classList.remove('auth-hidden');
+ syncPageChrome();await render();setIdentity();
+}
+
+// 后端把“邮箱已存在”按 409 duplicate_email 返回；这类错误按“账户已就绪”处理。
+function isAccountExistsError(error){const status=Number(error&&error.status)||0;const detail=`${(error&&error.code)||''} ${(error&&error.message)||''}`;return status===409||/duplicate_email|owner_exists|already exists|已存在|已注册|重复/i.test(detail)}
+
+/**
+ * 一键添加测试账户：调用已有注册接口创建 TEST_ACCOUNT，随后把邮箱与密码回填到
+ * 登录表单并尝试直接登录。账户已存在、或注册接口不可达时代码都会继续往下走，
+ * 保证按钮在这三种情况下都给出可读结果，且不会影响原有登录流程。
+ */
+async function addTestAccount(button,form){
+ const hint=qs('#testAccountHint');
+ const setHint=(text,cls='')=>{if(hint){hint.textContent=text;hint.className=cls?`form-help ${cls}`:'form-help'}};
+ if(button.disabled)return;
+ const label=button.textContent;
+ button.disabled=true;                            // 禁用态：避免重复点击
+ button.textContent='正在添加测试账户…';          // 加载态
+ setHint(`正在创建测试账户 ${TEST_ACCOUNT.email} …`);
+ let account='created',failure='';
+ try{
+  await api('/api/auth/register-team',{method:'POST',body:JSON.stringify({team_name:TEST_ACCOUNT.team,name:TEST_ACCOUNT.name,email:TEST_ACCOUNT.email,password:TEST_ACCOUNT.password})});
+ }catch(error){
+  if(isAccountExistsError(error)){account='exists'}
+  else{account='unavailable';failure=String((error&&error.message)||'创建测试账户失败')}
+ }
+ fillAuthForm(form,{email:TEST_ACCOUNT.email,password:TEST_ACCOUNT.password,team_name:TEST_ACCOUNT.team,name:TEST_ACCOUNT.name});
+ const summary=account==='created'?'测试账户已创建':account==='exists'?'测试账户已存在，按成功处理':`注册接口不可用（${failure}），已退化为仅自动填充邮箱与密码`;
+ setHint(`${summary}；已回填 ${TEST_ACCOUNT.email}，正在尝试登录…`);
+ try{
+  await submitAuthForm(form);
+  toast(account==='created'?'测试账户已创建并登录':'测试账户已存在，已直接登录');
+  return;                                         // 页面已切换，无需恢复按钮状态
+ }catch(error){
+  const reason=String((error&&error.message)||'');
+  const advice=account==='unavailable'?'未连接后端时无法真正登录：请先启动后端服务，或在 out/api-target.txt 中填写后端地址。':'若该邮箱此前用其他密码创建，请改用原密码登录。';
+  setHint(`${summary}；邮箱与密码已自动回填，点击「登录」即可。${reason?`自动登录未成功：${reason}。`:''}${advice}`,account==='unavailable'?'warn':'');
+ }finally{
+  button.disabled=false;
+  button.textContent=label;
+ }
+}
+
+function authPage(setup=false){
+ const isSetup=setup===true,isRegister=setup==='register-team',needsFields=isSetup||isRegister;
+ document.body.classList.add('auth-mode');qs('#sidebar').classList.add('auth-hidden');
+ qs('#crumb').textContent=needsFields?'创建团队':'账号登录';
+ qs('#pageRoot').innerHTML=`<div class="auth-shell"><div class="eyebrow">ARTSMART STRATEGY</div><h1>${needsFields?'创建团队管理员':'登录艺数智策'}</h1><p>${needsFields?'设置团队与负责人账号，建立独立的私有数据空间。':'使用团队负责人提供的邮箱与密码登录。'}</p><form id="authForm" class="auth-form">${needsFields?`<label>团队名称<input name="team_name" required value="示例艺术团队"/></label><label>你的姓名<input name="name" required/></label>`:''}<label>邮箱<input name="email" type="email" required autocomplete="username"/></label><label>密码<input name="password" type="password" required minlength="10" autocomplete="${needsFields?'new-password':'current-password'}"/></label><div id="authError" class="auth-error"></div><button class="btn-primary">${needsFields?'创建账号并进入':'登录'}</button></form>${needsFields?'':'<button id="createTeamAccount" class="btn-secondary" style="margin-top:10px">创建新的团队空间</button>'}${TEST_ACCOUNT_ENABLED?`<div class="test-account"><button id="addTestAccount" type="button" class="btn-secondary">一键添加测试账户</button><p id="testAccountHint" class="form-help">开发/测试用：创建 ${escapeHtml(TEST_ACCOUNT.email)} 并自动回填邮箱与密码；账户已存在时按成功处理。关闭方式：VITE_ENABLE_TEST_ACCOUNT=false。</p></div>`:''}<p class="disclaimer">你的记录仅在当前团队空间内可见。建议部署在本机或团队内网。</p></div>`;
+ const form=qs('#authForm');
+ form.onsubmit=async e=>{e.preventDefault();try{await submitAuthForm(form,{isSetup,isRegister});toast('登录成功')}catch(err){authFormError((err&&err.message)||String(err))}};
+ const create=qs('#createTeamAccount');
+ if(create)create.onclick=()=>authPage('register-team');
+ const addTest=qs('#addTestAccount');
+ if(addTest)addTest.onclick=()=>addTestAccount(addTest,form);
+}
 function setIdentity(){if(!state.user)return;qs('#teamName').textContent=state.user.team_name;qs('#userName').textContent=state.user.name;qs('#userRole').textContent=state.user.role==='owner'?'团队负责人':state.user.role==='editor'?'内容录入者':'只读查看者'}
 async function init(){try{state.runtimeMode=await api('/api/runtime-mode');const banner=qs('#persistenceBanner');if(banner&&state.runtimeMode.mode==='example'){banner.hidden=false;banner.textContent=state.runtimeMode.message+' 当前修改仅供本次演示使用。'}}catch(err){console.error('运行模式检测失败',err)}qs('#todayLabel').textContent=new Intl.DateTimeFormat('zh-CN',{year:'numeric',month:'long',day:'numeric',weekday:'short'}).format(new Date());qs('#menuToggle').onclick=()=>qs('#sidebar').classList.toggle('open');qs('#resetData').onclick=async()=>{try{await api('/api/auth/logout',{method:'POST'})}catch{}sessionStorage.removeItem('artsSessionToken');state.user=null;authPage(false)};try{const status=await api('/api/auth/status');if(status.setup_required){authPage(true);return}const token=sessionStorage.getItem('artsSessionToken');if(!token){authPage(false);return}state.user=await api('/api/auth/me');state.teamId=state.user.team_id;localStorage.setItem('artsTeamId',state.teamId);setIdentity();qs('#sidebar').classList.remove('auth-hidden');syncPageChrome();await render()}catch(e){authPage(false)}}
 init();

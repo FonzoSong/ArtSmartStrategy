@@ -263,3 +263,12 @@ body.auth-mode .main-area{margin-left:0;width:100%}body.auth-mode .topbar-right{
  .filter-bar .form-field{min-width:0;width:100%}
  .timeline-row{grid-template-columns:1fr;row-gap:4px}
 }
+
+/* 登录页 · 一键添加测试账户（仅开发/测试用，按钮由 VITE_ENABLE_TEST_ACCOUNT 控制） */
+.test-account{margin-top:16px;padding-top:15px;border-top:1px dashed #e0d8c8;display:grid;gap:9px}
+.test-account .btn-secondary{width:100%;padding:11px}
+.test-account .btn-secondary:disabled{opacity:.6;cursor:progress}
+.auth-form .btn-primary:disabled{opacity:.6;cursor:progress}
+.test-account .form-help{line-height:1.7;margin:0}
+.test-account .form-help.warn{color:#a8703c}
+.test-account .form-help.ok{color:#5f7a4f}
