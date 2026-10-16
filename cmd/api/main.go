@@ -62,7 +62,7 @@ func run(logger *slog.Logger) error {
 	handler := httpapi.New(cfg, repository.New(db), logger)
 	server := &http.Server{
 		Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout: 20 * time.Second, WriteTimeout: 90 * time.Second,
+		ReadTimeout: 20 * time.Second, WriteTimeout: apiWriteTimeout(cfg),
 		IdleTimeout: 60 * time.Second,
 	}
 	shutdown := make(chan os.Signal, 1)
@@ -79,6 +79,15 @@ func run(logger *slog.Logger) error {
 		return nil
 	}
 	return err
+}
+
+func apiWriteTimeout(cfg config.Config) time.Duration {
+	writeTimeout := 90 * time.Second
+	recommendationBudget := cfg.AIRecommendationTimeout + 2*cfg.RequestTimeout
+	if recommendationBudget > writeTimeout {
+		return recommendationBudget
+	}
+	return writeTimeout
 }
 
 func waitForDatabase(ctx context.Context, db *sql.DB, logger *slog.Logger) error {

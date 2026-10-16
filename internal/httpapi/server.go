@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -145,8 +146,13 @@ func New(cfg config.Config, store *repository.Postgres, logger *slog.Logger) htt
 	mux.Handle("GET /api/schedule/{id}/adjustments", server.authenticated(http.HandlerFunc(server.scheduleAdjustments)))
 	mux.Handle("POST /api/schedule/{id}/publish", server.authenticated(server.editors(http.HandlerFunc(server.publishSchedule))))
 	mux.Handle("POST /api/ai/recommend", server.authenticated(server.editors(http.HandlerFunc(server.generateRecommendations))))
+	mux.Handle("GET /api/ai/recommend/{id}", server.authenticated(http.HandlerFunc(server.aiRecommendationDetail)))
+	mux.Handle("POST /api/ai/recommend/{id}/regenerate", server.authenticated(server.editors(http.HandlerFunc(server.regenerateRecommendation))))
+	mux.Handle("POST /api/ai/recommend/{id}/apply", server.authenticated(server.editors(http.HandlerFunc(server.applyAIRecommendation))))
+	mux.Handle("POST /api/ai/recommend/{id}/revert", server.authenticated(server.editors(http.HandlerFunc(server.revertRecommendation))))
 	mux.Handle("GET /api/recommendations", server.authenticated(http.HandlerFunc(server.recommendations)))
 	mux.Handle("PATCH /api/recommendations/{id}", server.authenticated(server.editors(http.HandlerFunc(server.updateRecommendation))))
+	mux.Handle("POST /api/recommendations/{id}/revert", server.authenticated(server.editors(http.HandlerFunc(server.revertRecommendation))))
 	return server.middleware(mux)
 }
 
@@ -178,11 +184,33 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			return
 		}
 		started := time.Now()
-		ctx, cancel := context.WithTimeout(r.Context(), s.Config.RequestTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), s.requestTimeout(r))
 		defer cancel()
 		next.ServeHTTP(w, r.WithContext(ctx))
 		s.Log.Info("http request", "request_id", requestID, "method", r.Method, "path", r.URL.Path, "duration_ms", time.Since(started).Milliseconds())
 	})
+}
+
+// requestTimeout leaves the AI generation endpoint enough time to finish the
+// configured model wait and then persist/audit its rule-based fallback. Other
+// endpoints keep the normal request timeout.
+func (s *Server) requestTimeout(r *http.Request) time.Duration {
+	if isAIRecommendationGeneration(r) && s.Config.AIRecommendationTimeout > 0 {
+		// Keep one normal timeout window for loading candidates and one for
+		// persisting/auditing the fallback after the model wait.
+		return s.Config.AIRecommendationTimeout + 2*s.Config.RequestTimeout
+	}
+	return s.Config.RequestTimeout
+}
+
+func isAIRecommendationGeneration(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	if r.URL.Path == "/api/ai/recommend" {
+		return true
+	}
+	return strings.HasPrefix(r.URL.Path, "/api/ai/recommend/") && strings.HasSuffix(r.URL.Path, "/regenerate")
 }
 
 func (s *Server) live(w http.ResponseWriter, _ *http.Request) {
@@ -2581,8 +2609,18 @@ func (s *Server) adoptSchedules(w http.ResponseWriter, r *http.Request) {
 		item.PlannedDate, _ = row["planned_date"].(string)
 		item.TimeSlot, _ = row["time_slot"].(string)
 		item.Title, _ = row["title"].(string)
+		item.Owner, _ = row["owner"].(string)
+		item.Priority, _ = row["priority"].(string)
+		item.PriorityOrder = int(intField(row, "priority_order"))
+		item.RiskNotes, _ = row["risk_notes"].(string)
+		item.Reason, _ = row["reason"].(string)
+		item.PreviousSchedule, _ = row["previous_schedule"].(map[string]any)
 		if strings.TrimSpace(item.TargetContentID) == "" {
 			writeError(w, r, 422, "invalid_item", "建议条目缺少目标内容")
+			return
+		}
+		if len(item.Title) > 300 || len(item.Owner) > 100 || len(item.Reason) > 1000 || len(item.RiskNotes) > 1000 {
+			writeError(w, r, 422, "invalid_item", "建议标题、负责人或说明长度超出限制")
 			return
 		}
 		items = append(items, item)
@@ -2602,7 +2640,7 @@ func (s *Server) adoptSchedules(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSON(w, 200, map[string]any{"created": outcome.Created, "recommendations": outcome.Recommendations})
+	writeJSON(w, 200, map[string]any{"created": outcome.Created, "adjusted": outcome.Adjusted, "recommendations": outcome.Recommendations})
 }
 
 func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
@@ -2612,6 +2650,22 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	c := claimsFrom(r)
 	scheduleID := r.PathValue("id")
+	if priority, ok := fields["priority"].(string); ok && priority != "high" && priority != "medium" && priority != "low" {
+		writeError(w, r, 422, "invalid_priority", "排期优先级无效")
+		return
+	}
+	if risk, ok := fields["risk_notes"].(string); ok && len(risk) > 1000 {
+		writeError(w, r, 422, "invalid_risk_notes", "风险说明不能超过 1000 个字符")
+		return
+	}
+	if order, ok := fields["priority_order"]; ok {
+		parsed := intField(map[string]any{"priority_order": order}, "priority_order")
+		if parsed < 0 {
+			writeError(w, r, 422, "invalid_priority_order", "优先顺序无效")
+			return
+		}
+		fields["priority_order"] = parsed
+	}
 	date, hasDate := fields["planned_date"].(string)
 	clock, hasClock := fields["planned_time"].(string)
 	if hasDate {
@@ -2717,14 +2771,36 @@ func (s *Server) publishSchedule(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request) {
 	c := claimsFrom(r)
+	input, statusCode, errorCode, errorMessage := decodeScheduleRecommendationRequest(w, r, c.TeamID)
+	if statusCode != 0 {
+		writeError(w, r, statusCode, errorCode, errorMessage)
+		return
+	}
+	performanceID := input.PerformanceID
+	if queryPerformanceID := strings.TrimSpace(r.URL.Query().Get("performance_id")); queryPerformanceID != "" {
+		if performanceID != "" && performanceID != queryPerformanceID {
+			writeError(w, r, http.StatusBadRequest, "performance_filter_mismatch", "performanceId 与 performance_id 筛选不一致")
+			return
+		}
+		performanceID = queryPerformanceID
+	}
 	// Schedule suggestions only cover content waiting for a schedule; every other
 	// workflow state is filtered out in the query, so the rule cannot be bypassed
 	// by the client.
-	rows, err := s.Store.QueryMaps(r.Context(), `SELECT id,title,category,platform,owner,lifecycle,workflow_state FROM content WHERE team_id=$1 AND lifecycle='未发布' AND workflow_state='待排期' AND NOT EXISTS (SELECT 1 FROM schedule WHERE schedule.team_id=content.team_id AND schedule.content_id=content.id AND schedule.status='待发布') ORDER BY created_at`, c.TeamID)
-	if performanceID := strings.TrimSpace(r.URL.Query().Get("performance_id")); performanceID != "" {
+	candidateQuery := `SELECT c.id,c.title,c.category,c.platform,c.owner,c.lifecycle,c.workflow_state,
+		COALESCE((SELECT string_agg(t.name, chr(31) ORDER BY t.name) FROM content_tag ct JOIN tag t ON t.id=ct.tag_id AND t.team_id=c.team_id WHERE ct.content_id=c.id),
+			(SELECT string_agg(legacy.tag, chr(31) ORDER BY legacy.tag) FROM json_array_elements_text(c.tags_json::json) AS legacy(tag)), '') AS tags
+		FROM content c WHERE c.team_id=$1 AND c.lifecycle='未发布' AND c.workflow_state='待排期'
+		AND NOT EXISTS (SELECT 1 FROM schedule WHERE schedule.team_id=c.team_id AND schedule.content_id=c.id AND schedule.status='待发布') ORDER BY c.created_at`
+	rows, err := s.Store.QueryMaps(r.Context(), candidateQuery, c.TeamID)
+	if performanceID != "" {
 		// Optional show filter: the suggestion page can be scoped to one 正式演出
 		// while still using this same generation path.
-		rows, err = s.Store.QueryMaps(r.Context(), `SELECT id,title,category,platform,owner,lifecycle,workflow_state FROM content WHERE team_id=$1 AND performance_id=$2 AND lifecycle='未发布' AND workflow_state='待排期' AND NOT EXISTS (SELECT 1 FROM schedule WHERE schedule.team_id=content.team_id AND schedule.content_id=content.id AND schedule.status='待发布') ORDER BY created_at`, c.TeamID, performanceID)
+		rows, err = s.Store.QueryMaps(r.Context(), `SELECT c.id,c.title,c.category,c.platform,c.owner,c.lifecycle,c.workflow_state,
+			COALESCE((SELECT string_agg(t.name, chr(31) ORDER BY t.name) FROM content_tag ct JOIN tag t ON t.id=ct.tag_id AND t.team_id=c.team_id WHERE ct.content_id=c.id),
+				(SELECT string_agg(legacy.tag, chr(31) ORDER BY legacy.tag) FROM json_array_elements_text(c.tags_json::json) AS legacy(tag)), '') AS tags
+			FROM content c WHERE c.team_id=$1 AND c.performance_id=$2 AND c.lifecycle='未发布' AND c.workflow_state='待排期'
+			AND NOT EXISTS (SELECT 1 FROM schedule WHERE schedule.team_id=c.team_id AND schedule.content_id=c.id AND schedule.status='待发布') ORDER BY c.created_at`, c.TeamID, performanceID)
 	}
 	if err != nil {
 		writeError(w, r, 500, "candidate_query_failed", "读取待排期内容失败")
@@ -2732,11 +2808,33 @@ func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request)
 	}
 	candidates := make([]domain.Content, 0, len(rows))
 	for _, row := range rows {
-		candidates = append(candidates, domain.Content{ID: fmt.Sprint(row["id"]), Title: fmt.Sprint(row["title"]), Category: fmt.Sprint(row["category"]), Platform: fmt.Sprint(row["platform"]), Owner: fmt.Sprint(row["owner"]), Lifecycle: fmt.Sprint(row["lifecycle"]), WorkflowState: fmt.Sprint(row["workflow_state"])})
+		candidates = append(candidates, domain.Content{ID: fmt.Sprint(row["id"]), Title: fmt.Sprint(row["title"]), Category: fmt.Sprint(row["category"]), Platform: fmt.Sprint(row["platform"]), Owner: fmt.Sprint(row["owner"]), Lifecycle: fmt.Sprint(row["lifecycle"]), WorkflowState: fmt.Sprint(row["workflow_state"]), Tags: splitTagNames(stringField(row, "tags"))})
+	}
+	if len(input.ContentIDs) > 0 {
+		eligible := make(map[string]domain.Content, len(candidates))
+		for _, candidate := range candidates {
+			eligible[candidate.ID] = candidate
+		}
+		selected := make([]domain.Content, 0, len(input.ContentIDs))
+		for _, id := range input.ContentIDs {
+			candidate, ok := eligible[id]
+			if !ok {
+				writeError(w, r, http.StatusUnprocessableEntity, "content_not_schedulable", "所选内容必须属于当前团队并处于未发布 + 待排期状态，且没有待发布排期")
+				return
+			}
+			selected = append(selected, candidate)
+		}
+		candidates = selected
 	}
 	policy, window, ruleErr := s.loadPlanningRules(r.Context())
 	if ruleErr != nil {
 		writeRuleSetError(w, r, ruleErr)
+		return
+	}
+	planningNow := time.Now()
+	policy, window, planningNow, ruleErr = applyScheduleRecommendationConstraints(policy, window, planningNow, input.Constraints)
+	if ruleErr != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "schedule_constraints_rejected", ruleErr.Error())
 		return
 	}
 	policy.ExistingDaily = map[string]int{}
@@ -2766,18 +2864,23 @@ func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request)
 	}
 	activeSchedules.Close()
 	var samples []service.PerformanceSample
-	sampleRows, err := s.Store.DB.QueryContext(r.Context(), `SELECT category,platform,published_at,views,likes,comments,saves,shares,completion FROM content WHERE team_id=$1 AND lifecycle='已发布' AND workflow_state='已发布' ORDER BY published_at DESC`, c.TeamID)
+	sampleRows, err := s.Store.DB.QueryContext(r.Context(), `SELECT c.id,c.title,c.category,c.platform,c.published_at,c.duration,c.views,c.likes,c.comments,c.saves,c.shares,c.completion,c.profile_visits,c.follows,c.attendance,c.tickets,
+		COALESCE((SELECT string_agg(t.name, chr(31) ORDER BY t.name) FROM content_tag ct JOIN tag t ON t.id=ct.tag_id AND t.team_id=c.team_id WHERE ct.content_id=c.id),
+			(SELECT string_agg(legacy.tag, chr(31) ORDER BY legacy.tag) FROM json_array_elements_text(c.tags_json::json) AS legacy(tag)), '')
+		FROM content c WHERE c.team_id=$1 AND c.lifecycle='已发布' AND c.workflow_state='已发布' ORDER BY c.published_at DESC`, c.TeamID)
 	if err != nil {
 		writeError(w, r, 500, "history_query_failed", "读取已发布历史表现失败")
 		return
 	}
 	for sampleRows.Next() {
 		var item service.PerformanceSample
-		if err = sampleRows.Scan(&item.Category, &item.Platform, &item.PublishedAt, &item.Views, &item.Likes, &item.Comments, &item.Saves, &item.Shares, &item.Completion); err != nil {
+		var tags string
+		if err = sampleRows.Scan(&item.ID, &item.Title, &item.Category, &item.Platform, &item.PublishedAt, &item.Duration, &item.Views, &item.Likes, &item.Comments, &item.Saves, &item.Shares, &item.Completion, &item.ProfileVisits, &item.Follows, &item.Attendance, &item.Tickets, &tags); err != nil {
 			sampleRows.Close()
 			writeError(w, r, 500, "history_decode_failed", "读取历史表现数据失败")
 			return
 		}
+		item.Tags = splitTagNames(tags)
 		samples = append(samples, item)
 	}
 	if err = sampleRows.Err(); err != nil {
@@ -2786,27 +2889,44 @@ func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	sampleRows.Close()
-	local := service.BuildRuleSuggestions(time.Now(), candidates, samples, policy)
+	local := service.BuildRuleSuggestions(planningNow, candidates, samples, policy)
 	forceRule := strings.EqualFold(r.URL.Query().Get("force_rule"), "true")
 	selected := local
 	sourceLabel := "本地规则引擎"
 	status := "rule_fallback"
+	selectedModel := ""
 	fallbackReason := "AI 未配置或未请求，使用数据库规则集生成建议。"
 	if !forceRule && len(local) > 0 {
-		modelConfig, key, keyErr := s.modelCredential(r.Context(), c.TeamID)
-		if keyErr == nil && key != "" {
-			if aiItems, aiErr := s.callAI(r.Context(), modelConfig, key, candidates, samples, policy); aiErr == nil {
-				selected = aiItems
-				sourceLabel = "AI 分析"
-				status = "ai_completed"
-				fallbackReason = ""
-			} else {
-				fallbackReason = "AI 调用失败（" + aiErr.Error() + "），已降级到本地规则引擎。"
-			}
-		} else if keyErr != nil {
-			fallbackReason = "AI 配置不可用（" + keyErr.Error() + "），已降级到本地规则引擎。"
+		if s.Config.AIMockMode {
+			selected = mockAIRecommendations(local)
+			sourceLabel = "AI 分析（本地模拟）"
+			status = "ai_mock"
+			fallbackReason = "AI_MOCK_MODE 已启用；使用同 Tag 样本与规则集生成可重复的本地模拟建议。"
 		} else {
-			fallbackReason = "AI_API_KEY 未配置，已使用本地规则引擎。"
+			modelConfig, key, keyErr := s.modelCredential(r.Context(), c.TeamID)
+			if keyErr == nil && key != "" {
+				selectedModel = modelConfig.Model
+				if aiItems, aiErr := s.callAI(r.Context(), modelConfig, key, candidates, samples, policy, service.AIRecommendationOptions{Strategy: input.Strategy, Constraints: input.Constraints, ReferenceTime: planningNow, Timeout: s.Config.AIRecommendationTimeout}); aiErr == nil {
+					selected = aiItems
+					sourceLabel = "AI 分析"
+					status = "ai_completed"
+					fallbackReason = ""
+				} else {
+					var invalidResponse *service.AIRecommendationResponseError
+					if errors.As(aiErr, &invalidResponse) {
+						s.Log.Error("AI schedule recommendation failed structured validation after retry", "team_id", c.TeamID, "model", modelConfig.Model, "validation_error", invalidResponse.ValidationError, "raw_response", invalidResponse.RawResponse)
+						fallbackReason = "AI 返回内容未通过结构化校验（已重试一次），已降级到本地规则引擎。"
+					} else if errors.Is(aiErr, context.DeadlineExceeded) {
+						fallbackReason = fmt.Sprintf("AI 等待超过已配置上限（%s），已自动使用本地规则生成并保存排期建议。", s.Config.AIRecommendationTimeout)
+					} else {
+						fallbackReason = "AI 调用失败（" + aiErr.Error() + "），已降级到本地规则引擎。"
+					}
+				}
+			} else if keyErr != nil {
+				fallbackReason = "AI 配置不可用（" + keyErr.Error() + "），已降级到本地规则引擎。"
+			} else {
+				fallbackReason = "AI_API_KEY 未配置，已使用本地规则引擎。"
+			}
 		}
 	}
 	if len(candidates) == 0 {
@@ -2816,10 +2936,18 @@ func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request)
 	}
 	selected = s.annotateSuggestionValidity(r.Context(), c.TeamID, selected, policy, window)
 	referenceCount := 0
+	conflicts := make([]map[string]any, 0)
 	for _, item := range selected {
 		referenceCount += item.ReferenceSampleCount
+		if item.InvalidReason != "" {
+			conflicts = append(conflicts, map[string]any{"type": "schedule_policy", "severity": "warning", "content_id": item.TargetContentID, "message": item.InvalidReason})
+		}
+		if item.ReferenceSampleCount < 5 {
+			conflicts = append(conflicts, map[string]any{"type": "insufficient_samples", "severity": "warning", "content_id": item.TargetContentID, "message": fmt.Sprintf("该内容只有 %d 条共享 Tag 的已发布样本，少于建议的 5 条；结果仅供参考。", item.ReferenceSampleCount)})
+		}
 	}
-	payload := map[string]any{"recommendations": selected}
+	summary := fmt.Sprintf("为 %d 条待排期内容生成建议，匹配同 Tag 已发布历史样本共 %d 条。", len(selected), referenceCount)
+	payload := map[string]any{"recommendations": selected, "conflicts": conflicts, "summary": summary, "strategy": input.Strategy}
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
 		writeError(w, r, 500, "recommendation_encode_failed", "编码排期建议失败")
@@ -2827,8 +2955,28 @@ func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request)
 	}
 	id := uuid.NewString()
 	label := sourceLabel
-	_, err = s.Store.DB.ExecContext(r.Context(), `INSERT INTO recommendation(id,team_id,generated_at,payload_json,source_model,source_label,confidence,reference_count,analysis_status,fallback_reason,adopted) VALUES($1,$2,NOW(),$3,$4,$5,$6,$7,$8,$9,FALSE)`, id, c.TeamID, string(payloadJSON), map[bool]string{true: s.Config.AIModel, false: "rules"}[sourceLabel == "AI 分析"], label, "low", referenceCount, status, fallbackReason)
+	sourceModel := "rules"
+	if status == "ai_completed" {
+		sourceModel = selectedModel
+	} else if status == "ai_mock" {
+		sourceModel = "local-mock"
+	}
+	tx, err := s.Store.DB.BeginTx(r.Context(), nil)
 	if err != nil {
+		writeError(w, r, 500, "recommendation_save_failed", "保存排期建议失败")
+		return
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(r.Context(), `INSERT INTO recommendation(id,team_id,generated_at,payload_json,source_model,source_label,confidence,reference_count,analysis_status,fallback_reason,adopted) VALUES($1,$2,NOW(),$3,$4,$5,$6,$7,$8,$9,FALSE)`, id, c.TeamID, string(payloadJSON), sourceModel, label, "low", referenceCount, status, fallbackReason)
+	if err != nil {
+		writeError(w, r, 500, "recommendation_save_failed", "保存排期建议失败")
+		return
+	}
+	if _, err = tx.ExecContext(r.Context(), `INSERT INTO audit_log(team_id,actor,action,entity_type,entity_id,detail,created_at) VALUES($1,$2,'generate_schedule_recommendation','recommendation',$3,$4,NOW())`, c.TeamID, c.Name, id, fmt.Sprintf("生成%s：待排期内容 %d 条，匹配共享 Tag 历史样本 %d 条", label, len(candidates), referenceCount)); err != nil {
+		writeError(w, r, 500, "recommendation_audit_failed", "记录排期建议生成审计失败")
+		return
+	}
+	if err = tx.Commit(); err != nil {
 		writeError(w, r, 500, "recommendation_save_failed", "保存排期建议失败")
 		return
 	}
@@ -2836,7 +2984,7 @@ func (s *Server) generateRecommendations(w http.ResponseWriter, r *http.Request)
 	if referenceCount >= 10 {
 		confidenceNote = "基于同团队历史数据；结果不构成效果保证。"
 	}
-	writeJSON(w, 200, map[string]any{"id": id, "source": sourceLabel, "source_label": sourceLabel, "analysis_status": status, "reference_count": referenceCount, "confidence": "low", "confidence_note": confidenceNote, "fallback_reason": fallbackReason, "recommendations": selected})
+	writeJSON(w, 200, map[string]any{"id": id, "source": sourceLabel, "source_label": sourceLabel, "analysis_status": status, "strategy": input.Strategy, "model": sourceModel, "reference_count": referenceCount, "confidence": "low", "confidence_note": confidenceNote, "fallback_reason": fallbackReason, "summary": summary, "conflicts": conflicts, "recommendations": selected})
 }
 
 // annotateSuggestionValidity re-checks each generated suggestion against the
@@ -2976,125 +3124,42 @@ func (s *Server) modelCredential(ctx context.Context, teamID int64) (aiModelConf
 	return model, key, nil
 }
 
-func (s *Server) callAI(ctx context.Context, model aiModelConfig, key string, candidates []domain.Content, samples []service.PerformanceSample, policy service.SlotPolicy) ([]service.Suggestion, error) {
-	promptData := map[string]any{"candidates": candidates, "published_history": samples, "schedule_policy": policy}
-	encoded, err := json.Marshal(promptData)
-	if err != nil {
-		return nil, errors.New("准备 AI 分析输入失败")
+func (s *Server) callAI(ctx context.Context, model aiModelConfig, key string, candidates []domain.Content, samples []service.PerformanceSample, policy service.SlotPolicy, options ...service.AIRecommendationOptions) ([]service.Suggestion, error) {
+	return service.GenerateAIRecommendations(ctx, service.AIModelConfig{BaseURL: model.BaseURL, Model: model.Model}, key, candidates, samples, policy, options...)
+}
+
+func splitTagNames(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return []string{}
 	}
-	body, err := json.Marshal(map[string]any{"model": model.Model, "temperature": 0.2, "messages": []map[string]string{{"role": "system", "content": "你是内容排期分析器。只根据提供的历史样本和规则集为未发布内容推荐。只返回 JSON 对象 {\"recommendations\":[{\"target_content_id\":string,\"planned_date\":\"YYYY-MM-DD\",\"time_slot\":\"HH:MM\",\"reason\":string}]}。不得生成输入外的内容 ID。"}, {"role": "user", "content": string(encoded)}}})
-	if err != nil {
-		return nil, errors.New("编码 AI 请求失败")
-	}
-	endpoint := openAIURL(model.BaseURL, "/chat/completions")
-	requestCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, strings.NewReader(string(body)))
-	if err != nil {
-		return nil, errors.New("构造 AI 请求失败")
-	}
-	request.Header.Set("Authorization", "Bearer "+key)
-	request.Header.Set("Content-Type", "application/json")
-	client := http.Client{Timeout: 60 * time.Second}
-	response, err := client.Do(request)
-	if err != nil {
-		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
-			return nil, errors.New("调用超过 60 秒")
+	parts := strings.Split(value, string(rune(31)))
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			result = append(result, part)
 		}
-		return nil, errors.New("网络请求失败")
 	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, fmt.Errorf("服务返回 HTTP %d", response.StatusCode)
-	}
-	var completion struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err = json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&completion); err != nil || len(completion.Choices) == 0 {
-		return nil, errors.New("模型响应格式无效")
-	}
-	var generated struct {
-		Recommendations []struct {
-			TargetContentID string `json:"target_content_id"`
-			PlannedDate     string `json:"planned_date"`
-			TimeSlot        string `json:"time_slot"`
-			Reason          string `json:"reason"`
-		} `json:"recommendations"`
-	}
-	if err = json.Unmarshal([]byte(completion.Choices[0].Message.Content), &generated); err != nil {
-		return nil, errors.New("模型没有返回预期 JSON")
-	}
-	byID := make(map[string]domain.Content, len(candidates))
-	for _, item := range candidates {
-		byID[item.ID] = item
-	}
-	allowedTimes := map[string]bool{}
-	for _, clock := range policy.TimeWindows {
-		allowedTimes[clock] = true
-	}
-	allowedWeekdays := map[string]bool{}
-	for _, day := range policy.Weekdays {
-		allowedWeekdays[day] = true
-	}
-	usedDaily := map[string]int{}
-	for key, count := range policy.ExistingDaily {
-		usedDaily[key] = count
-	}
-	usedWeekly := map[string]int{}
-	for key, count := range policy.ExistingPlatformWeekly {
-		usedWeekly[key] = count
-	}
-	usedContent := map[string]bool{}
-	result := make([]service.Suggestion, 0, len(generated.Recommendations))
-	window, windowOK := policy.Window(time.Now())
-	if !windowOK {
-		return nil, errors.New("排期规则集缺少有效周期")
-	}
-	for _, item := range generated.Recommendations {
-		candidate, ok := byID[item.TargetContentID]
-		if !ok || usedContent[item.TargetContentID] || !allowedTimes[item.TimeSlot] || strings.TrimSpace(item.Reason) == "" {
-			return nil, errors.New("模型建议包含无效内容或时间")
+	return result
+}
+
+func mockAIRecommendations(ruleItems []service.Suggestion) []service.Suggestion {
+	result := append([]service.Suggestion{}, ruleItems...)
+	for index := range result {
+		result[index].SuggestionSource = "AI 模拟"
+		result[index].PriorityOrder = index + 1
+		if index == 0 {
+			result[index].Priority = "high"
+		} else if index >= len(result)*2/3 {
+			result[index].Priority = "low"
+		} else {
+			result[index].Priority = "medium"
 		}
-		planned, parseErr := time.Parse("2006-01-02", item.PlannedDate)
-		if parseErr != nil || !window.Contains(item.PlannedDate) || len(allowedWeekdays) > 0 && !allowedWeekdays[weekdayName(planned.Weekday())] {
-			return nil, errors.New("模型建议日期超出规则时间范围")
+		if result[index].ConfidenceScore == 0 {
+			result[index].ConfidenceScore = 0.35
 		}
-		usedDaily[item.PlannedDate]++
-		if policy.MaxPerDay > 0 && usedDaily[item.PlannedDate] > policy.MaxPerDay {
-			return nil, errors.New("模型建议超过每日发布频率")
-		}
-		year, week := planned.ISOWeek()
-		weekKey := candidate.Platform + ":" + strconv.Itoa(year) + ":" + strconv.Itoa(week)
-		usedWeekly[weekKey]++
-		if policy.MaxPerPlatformPerWeek > 0 && usedWeekly[weekKey] > policy.MaxPerPlatformPerWeek {
-			return nil, errors.New("模型建议超过平台每周发布频率")
-		}
-		usedContent[item.TargetContentID] = true
-		sampleCount := 0
-		for _, sample := range samples {
-			if sample.Category == candidate.Category && sample.Platform == candidate.Platform {
-				sampleCount++
-			}
-		}
-		confidence := "低"
-		limit := "历史样本不足，建议结合团队判断。"
-		if sampleCount >= 3 {
-			confidence = "中"
-		}
-		if sampleCount >= 10 {
-			confidence = "高"
-			limit = "根据同团队已发布样本分析，实际表现可能不同。"
-		}
-		result = append(result, service.Suggestion{TargetContentID: candidate.ID, Title: candidate.Title, ContentType: candidate.Category, Platform: candidate.Platform, Owner: candidate.Owner, PlannedDate: item.PlannedDate, DayOfWeek: weekdayName(planned.Weekday()), TimeSlot: item.TimeSlot, Reason: item.Reason, SuggestionSource: "AI", ReferenceSampleCount: sampleCount, Confidence: confidence, Limitations: limit})
+		result[index].RiskNotes = "本地模拟结果，仅用于开发预览；请人工检查排期冲突。"
 	}
-	if len(result) == 0 && len(candidates) > 0 {
-		return nil, errors.New("模型未返回有效建议")
-	}
-	return result, nil
+	return result
 }
 
 func weekdayName(day time.Weekday) string {
@@ -3121,6 +3186,65 @@ func (s *Server) recommendations(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, rows)
 }
 
+func (s *Server) aiRecommendationDetail(w http.ResponseWriter, r *http.Request) {
+	var id, payloadJSON, sourceModel, sourceLabel, confidence, analysisStatus, fallbackReason string
+	var generatedAt time.Time
+	var referenceCount int
+	var adopted bool
+	if err := s.Store.DB.QueryRowContext(r.Context(), `SELECT id,generated_at,payload_json,source_model,source_label,confidence,reference_count,analysis_status,fallback_reason,adopted FROM recommendation WHERE id=$1 AND team_id=$2`, r.PathValue("id"), claimsFrom(r).TeamID).Scan(
+		&id, &generatedAt, &payloadJSON, &sourceModel, &sourceLabel, &confidence, &referenceCount, &analysisStatus, &fallbackReason, &adopted,
+	); err != nil {
+		notFoundOrError(w, r, err, "排期建议不存在")
+		return
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		writeError(w, r, 500, "recommendation_decode_failed", "排期建议记录格式无效")
+		return
+	}
+	row := map[string]any{"id": id, "generated_at": generatedAt, "source_model": sourceModel, "source_label": sourceLabel, "confidence": confidence, "reference_count": referenceCount, "analysis_status": analysisStatus, "fallback_reason": fallbackReason, "adopted": adopted}
+	for key, value := range payload {
+		row[key] = value
+	}
+	delete(row, "payload_json")
+	row["confidence_note"] = "建议可信度受匹配历史样本量限制。"
+	writeJSON(w, 200, row)
+}
+
+func (s *Server) regenerateRecommendation(w http.ResponseWriter, r *http.Request) {
+	var exists bool
+	if err := s.Store.DB.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM recommendation WHERE id=$1 AND team_id=$2)`, r.PathValue("id"), claimsFrom(r).TeamID).Scan(&exists); err != nil {
+		writeError(w, r, 500, "recommendation_read_failed", "读取排期建议失败")
+		return
+	}
+	if !exists {
+		writeError(w, r, 404, "recommendation_not_found", "排期建议不存在")
+		return
+	}
+	// Regeneration uses the same validated request contract and creates a new
+	// draft; the earlier recommendation remains available for audit and revert.
+	s.generateRecommendations(w, r)
+}
+
+func (s *Server) applyAIRecommendation(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Items []map[string]any `json:"items"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{"recommendation_id": r.PathValue("id"), "items": input.Items})
+	if err != nil {
+		writeError(w, r, 400, "invalid_recommendation", "建议格式无效")
+		return
+	}
+	request := r.Clone(r.Context())
+	request.Body = io.NopCloser(bytes.NewReader(payload))
+	request.ContentLength = int64(len(payload))
+	request.Header.Set("Content-Type", "application/json")
+	s.adoptSchedules(w, request)
+}
+
 func (s *Server) updateRecommendation(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Recommendations []service.Suggestion `json:"recommendations"`
@@ -3128,12 +3252,99 @@ func (s *Server) updateRecommendation(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &input) {
 		return
 	}
-	payload, err := json.Marshal(map[string]any{"recommendations": input.Recommendations})
+	c := claimsFrom(r)
+	var raw string
+	if err := s.Store.DB.QueryRowContext(r.Context(), `SELECT payload_json FROM recommendation WHERE id=$1 AND team_id=$2`, r.PathValue("id"), c.TeamID).Scan(&raw); err != nil {
+		notFoundOrError(w, r, err, "排期建议不存在")
+		return
+	}
+	var saved struct {
+		Recommendations []service.Suggestion `json:"recommendations"`
+	}
+	if err := json.Unmarshal([]byte(raw), &saved); err != nil {
+		writeError(w, r, 500, "recommendation_decode_failed", "排期建议记录格式无效")
+		return
+	}
+	byID := make(map[string]service.Suggestion, len(saved.Recommendations))
+	for _, item := range saved.Recommendations {
+		byID[item.TargetContentID] = item
+	}
+	seen := map[string]bool{}
+	for index := range input.Recommendations {
+		edited := input.Recommendations[index]
+		original, ok := byID[edited.TargetContentID]
+		if !ok || seen[edited.TargetContentID] {
+			writeError(w, r, 422, "invalid_recommendation", "建议内容不属于原始草稿或存在重复")
+			return
+		}
+		if original.Adopted {
+			if edited.Title != original.Title || edited.PlannedDate != original.PlannedDate || edited.TimeSlot != original.TimeSlot || edited.Owner != original.Owner || edited.Priority != original.Priority {
+				writeError(w, r, 422, "recommendation_already_applied", "已采纳的建议不能在草稿中编辑")
+				return
+			}
+			input.Recommendations[index] = original
+			seen[edited.TargetContentID] = true
+			continue
+		}
+		date, err := repository.ParsePlannedDate(edited.PlannedDate)
+		if err != nil {
+			writeError(w, r, 422, "invalid_recommendation_date", err.Error())
+			return
+		}
+		if _, err = time.Parse("15:04", edited.TimeSlot); err != nil {
+			writeError(w, r, 422, "invalid_recommendation_time", "建议时间格式必须为 HH:MM")
+			return
+		}
+		if strings.TrimSpace(edited.Title) == "" || len(edited.Title) > 300 || len(edited.Owner) > 100 {
+			writeError(w, r, 422, "invalid_recommendation_fields", "标题或负责人长度无效")
+			return
+		}
+		if edited.Priority != "high" && edited.Priority != "medium" && edited.Priority != "low" {
+			writeError(w, r, 422, "invalid_recommendation_priority", "排期优先级无效")
+			return
+		}
+		original.Title = strings.TrimSpace(edited.Title)
+		original.PlannedDate = date
+		planned, _ := time.Parse("2006-01-02", date)
+		original.DayOfWeek = weekdayName(planned.Weekday())
+		original.TimeSlot = edited.TimeSlot
+		original.Owner = strings.TrimSpace(edited.Owner)
+		original.Priority = edited.Priority
+		if edited.PriorityOrder > 0 {
+			original.PriorityOrder = edited.PriorityOrder
+		}
+		input.Recommendations[index] = original
+		seen[edited.TargetContentID] = true
+	}
+	for _, original := range saved.Recommendations {
+		if original.Adopted && !seen[original.TargetContentID] {
+			writeError(w, r, 422, "recommendation_already_applied", "已采纳的建议不能从记录中移除")
+			return
+		}
+	}
+	payloadFields := map[string]json.RawMessage{}
+	if err := json.Unmarshal([]byte(raw), &payloadFields); err != nil {
+		writeError(w, r, 500, "recommendation_decode_failed", "排期建议记录格式无效")
+		return
+	}
+	recommendationsJSON, err := json.Marshal(input.Recommendations)
 	if err != nil {
 		writeError(w, r, 400, "invalid_recommendation", "建议格式无效")
 		return
 	}
-	result, err := s.Store.DB.ExecContext(r.Context(), `UPDATE recommendation SET payload_json=$1 WHERE id=$2 AND team_id=$3`, string(payload), r.PathValue("id"), claimsFrom(r).TeamID)
+	payloadFields["recommendations"] = recommendationsJSON
+	payload, err := json.Marshal(payloadFields)
+	if err != nil {
+		writeError(w, r, 400, "invalid_recommendation", "建议格式无效")
+		return
+	}
+	tx, err := s.Store.DB.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, r, 500, "recommendation_update_failed", "保存建议调整失败")
+		return
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(r.Context(), `UPDATE recommendation SET payload_json=$1 WHERE id=$2 AND team_id=$3`, string(payload), r.PathValue("id"), c.TeamID)
 	if err != nil {
 		writeError(w, r, 500, "recommendation_update_failed", "保存建议调整失败")
 		return
@@ -3143,7 +3354,29 @@ func (s *Server) updateRecommendation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 404, "not_found", "排期建议不存在")
 		return
 	}
+	if _, err = tx.ExecContext(r.Context(), `INSERT INTO audit_log(team_id,actor,action,entity_type,entity_id,detail,created_at) VALUES($1,$2,'edit_schedule_recommendation','recommendation',$3,$4,NOW())`, c.TeamID, c.Name, r.PathValue("id"), fmt.Sprintf("保存排期建议编辑 %d 条", len(input.Recommendations))); err != nil {
+		writeError(w, r, 500, "recommendation_audit_failed", "记录建议编辑审计失败")
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeError(w, r, 500, "recommendation_update_failed", "保存建议调整失败")
+		return
+	}
 	writeJSON(w, 200, map[string]any{"recommendations": input.Recommendations})
+}
+
+func (s *Server) revertRecommendation(w http.ResponseWriter, r *http.Request) {
+	c := claimsFrom(r)
+	count, err := s.Store.RevertRecommendation(r.Context(), c.TeamID, c.UserID, c.Name, r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, r, 404, "recommendation_not_found", "排期建议不存在")
+		} else {
+			writeError(w, r, 422, "recommendation_revert_failed", err.Error())
+		}
+		return
+	}
+	writeJSON(w, 200, map[string]any{"reverted": count})
 }
 
 func (s *Server) authError(w http.ResponseWriter, r *http.Request, err error) {

@@ -20,6 +20,21 @@ export function resolveDevApiTarget(raw: string | undefined | null): string {
   return `http://${value}`;
 }
 
+function readGoDuration(raw: string | undefined, fallback: number): number {
+  const value = raw?.trim();
+  if (!value) return fallback;
+  const token = /(\d+(?:\.\d+)?)(ms|s|m|h)/gy;
+  let consumed = 0;
+  let total = 0;
+  let match: RegExpExecArray | null;
+  while ((match = token.exec(value)) !== null) {
+    consumed += match[0].length;
+    const unit = match[2] === "h" ? 3_600_000 : match[2] === "m" ? 60_000 : match[2] === "s" ? 1_000 : 1;
+    total += Number(match[1]) * unit;
+  }
+  return consumed === value.length && total > 0 ? total : fallback;
+}
+
 /**
  * The dev server keeps the browser on one origin and proxies `/api` to the Go
  * backend, so the frontend needs no CORS setup and no backend address in the
@@ -33,8 +48,12 @@ export function resolveDevApiTarget(raw: string | undefined | null): string {
  */
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "");
+  const rootEnv = loadEnv(mode, "..", "");
   const devApiTarget = resolveDevApiTarget(process.env.VITE_DEV_API_TARGET || env.VITE_DEV_API_TARGET);
   const devPort = Number(process.env.WEB_DEV_PORT || env.WEB_DEV_PORT || 5173);
+  const requestTimeoutMs = readGoDuration(process.env.REQUEST_TIMEOUT || env.REQUEST_TIMEOUT || rootEnv.REQUEST_TIMEOUT, 15_000);
+  const aiRecommendationTimeoutMs = readGoDuration(process.env.AI_RECOMMENDATION_TIMEOUT || env.AI_RECOMMENDATION_TIMEOUT || rootEnv.AI_RECOMMENDATION_TIMEOUT, 30_000);
+  const proxyTimeoutMs = Math.max(20_000, aiRecommendationTimeoutMs + 2 * requestTimeoutMs + 30_000);
   return {
     server: {
       host: "0.0.0.0",
@@ -43,9 +62,9 @@ export default defineConfig(({ mode }) => {
         "/api": {
           target: devApiTarget,
           changeOrigin: true,
-          // The backend itself gives up after REQUEST_TIMEOUT (15s), so a little
-          // headroom here keeps a silent network drop from hanging the page.
-          proxyTimeout: 20000,
+          // Leave room for AI_RECOMMENDATION_TIMEOUT plus the API's request-data
+          // and persistence windows. The API still enforces the model wait limit.
+          proxyTimeout: proxyTimeoutMs,
           // The API answers `403 跨域来源未获允许` whenever a request carries an
           // `Origin` that is not listed in the server's CORS_ALLOWED_ORIGINS.
           // Browsers send `Origin` on POST/PATCH/DELETE even for same-origin

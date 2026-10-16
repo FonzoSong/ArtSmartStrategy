@@ -14,31 +14,43 @@ import (
 
 // Config contains runtime settings for the API and PostgreSQL service.
 type Config struct {
-	Address        string
-	DatabaseURL    string
-	AppSecret      string
-	AllowedOrigins []string
-	RequestTimeout time.Duration
-	PoolMax        int
-	PoolMin        int
-	AIBaseURL      string
-	AIModel        string
-	AIAPIKey       string
+	Address                 string
+	DatabaseURL             string
+	AppSecret               string
+	AllowedOrigins          []string
+	RequestTimeout          time.Duration
+	AIRecommendationTimeout time.Duration
+	PoolMax                 int
+	PoolMin                 int
+	AIBaseURL               string
+	AIModel                 string
+	AIAPIKey                string
+	AIMockMode              bool
 }
 
 // Load reads and validates environment-backed service configuration.
 func Load() (Config, error) {
+	aiRecommendationTimeout := 30 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("AI_RECOMMENDATION_TIMEOUT")); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, errors.New("AI_RECOMMENDATION_TIMEOUT must be a valid Go duration")
+		}
+		aiRecommendationTimeout = parsed
+	}
 	cfg := Config{
-		Address:        envOr("API_ADDR", ":8080"),
-		DatabaseURL:    strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		AppSecret:      os.Getenv("APP_SECRET"),
-		AllowedOrigins: splitList(envOr("CORS_ALLOWED_ORIGINS", "http://localhost:5173")),
-		RequestTimeout: durationOr("REQUEST_TIMEOUT", 15*time.Second),
-		PoolMax:        intOr("DB_POOL_MAX", 20),
-		PoolMin:        intOr("DB_POOL_MIN", 2),
-		AIBaseURL:      strings.TrimRight(envOr("AI_BASE_URL", "https://api.kunyou.asia/v1"), "/"),
-		AIModel:        envOr("AI_MODEL", "qwen3.8-max"),
-		AIAPIKey:       os.Getenv("AI_API_KEY"),
+		Address:                 envOr("API_ADDR", ":8080"),
+		DatabaseURL:             strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		AppSecret:               os.Getenv("APP_SECRET"),
+		AllowedOrigins:          splitList(envOr("CORS_ALLOWED_ORIGINS", "http://localhost:5173")),
+		RequestTimeout:          durationOr("REQUEST_TIMEOUT", 15*time.Second),
+		AIRecommendationTimeout: aiRecommendationTimeout,
+		PoolMax:                 intOr("DB_POOL_MAX", 20),
+		PoolMin:                 intOr("DB_POOL_MIN", 2),
+		AIBaseURL:               strings.TrimRight(envOr("AI_BASE_URL", "https://api.kunyou.asia/v1"), "/"),
+		AIModel:                 envOr("AI_MODEL", "qwen3.8-max"),
+		AIAPIKey:                os.Getenv("AI_API_KEY"),
+		AIMockMode:              boolOr("AI_MOCK", boolOr("AI_MOCK_MODE", false)),
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, errors.New("DATABASE_URL must point to the PostgreSQL service")
@@ -58,6 +70,9 @@ func Load() (Config, error) {
 	}
 	if cfg.RequestTimeout < time.Second || cfg.RequestTimeout > time.Minute {
 		return Config{}, errors.New("REQUEST_TIMEOUT must be between 1s and 60s")
+	}
+	if cfg.AIRecommendationTimeout < time.Second || cfg.AIRecommendationTimeout > 10*time.Minute {
+		return Config{}, errors.New("AI_RECOMMENDATION_TIMEOUT must be between 1s and 10m")
 	}
 	return cfg, nil
 }
@@ -141,6 +156,18 @@ func intOr(key string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func boolOr(key string, fallback bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
 	if err != nil {
 		return fallback
 	}

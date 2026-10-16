@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { WORKFLOW, WORKFLOW_STATES } from "../src/components/workflow.ts";
-import { NO_FINISHED_VIDEO_TEXT, isReadySuggestionCandidate, showNoFinishedVideoEmptyState } from "../src/lib/suggestions.ts";
+import { buildScheduleRecommendationRequest, NO_SCHEDULE_CANDIDATE_TEXT, showNoScheduleCandidateEmptyState } from "../src/lib/suggestions.ts";
 
 test("content record tabs keep the required category order", () => {
   assert.deepEqual(WORKFLOW_STATES, ["待制作", "已制作", "待排期", "已排期", "未发布", "已发布"]);
@@ -22,21 +22,29 @@ test("every workflow state label still matches the domain values", () => {
   ]);
 });
 
-test("only unpublished finished content is a suggestion candidate", () => {
-  assert.equal(isReadySuggestionCandidate("未发布", "已制作"), true);
-  assert.equal(isReadySuggestionCandidate("未发布", "待制作"), false);
-  assert.equal(isReadySuggestionCandidate("未发布", "待排期"), false);
-  assert.equal(isReadySuggestionCandidate("未发布", "已排期"), false);
-  assert.equal(isReadySuggestionCandidate("未发布", "未发布"), false);
-  assert.equal(isReadySuggestionCandidate("已发布", "已发布"), false);
-  assert.equal(isReadySuggestionCandidate(null, null), false);
-  assert.equal(isReadySuggestionCandidate("已发布", "已制作"), false);
+test("the no-schedule-candidate empty state only applies without candidates", () => {
+  assert.equal(showNoScheduleCandidateEmptyState("no_candidates", 3), true, "the backend already knows there is no candidate");
+  assert.equal(showNoScheduleCandidateEmptyState("rule_fallback", 0), true, "no eligible scheduling content in the team");
+  assert.equal(showNoScheduleCandidateEmptyState("rule_fallback", 2), false, "eligible content exists, so keep the normal empty text");
+  assert.equal(showNoScheduleCandidateEmptyState("ai_completed", 1), false);
+  assert.equal(NO_SCHEDULE_CANDIDATE_TEXT, "当前无待排期内容");
 });
 
-test("the no-finished-video empty state only applies without candidates", () => {
-  assert.equal(showNoFinishedVideoEmptyState("no_candidates", 3), true, "the backend already knows there is no candidate");
-  assert.equal(showNoFinishedVideoEmptyState("rule_fallback", 0), true, "no finished video in the team");
-  assert.equal(showNoFinishedVideoEmptyState("rule_fallback", 2), false, "a finished video exists, so keep the normal empty text");
-  assert.equal(showNoFinishedVideoEmptyState("ai_completed", 1), false);
-  assert.equal(NO_FINISHED_VIDEO_TEXT, "当前无制作完毕视频");
+test("AI scheduling requests include the authenticated project scope and active filter", () => {
+  assert.deepEqual(buildScheduleRecommendationRequest({ teamId: "12", performanceId: "performance-4" }), {
+    projectId: 12,
+    contentIds: [],
+    strategy: "balanced",
+    constraints: {},
+    performanceId: "performance-4",
+  });
+});
+
+test("AI scheduling requests normalize explicit content IDs without duplicates", () => {
+  assert.deepEqual(buildScheduleRecommendationRequest({ teamId: 12, contentIds: ["a", "a", 7, ""] }), {
+    projectId: 12,
+    contentIds: ["a", "7"],
+    strategy: "balanced",
+    constraints: {},
+  });
 });

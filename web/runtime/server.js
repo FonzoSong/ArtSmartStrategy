@@ -30,6 +30,8 @@ const HOST = process.env.ARTSMART_HOST || "127.0.0.1";
 const DEFAULT_PORT = 8080;
 const MAX_PORT_ATTEMPTS = 20;
 const PROXY_TIMEOUT_MS = 20000;
+const REQUEST_TIMEOUT_MS = readGoDuration(readProjectSetting("REQUEST_TIMEOUT"), 15000);
+const AI_RECOMMENDATION_TIMEOUT_MS = readGoDuration(readProjectSetting("AI_RECOMMENDATION_TIMEOUT"), 30000);
 const args = process.argv.slice(2);
 
 /** 读取 `--flag value` 形式的命令行参数。 */
@@ -43,6 +45,50 @@ function readStartPort() {
   const raw = readArg("--port") || process.env.ARTSMART_PORT || "";
   const port = Number.parseInt(raw, 10);
   return Number.isInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_PORT;
+}
+
+function readGoDuration(value, fallback) {
+  const input = String(value || "").trim();
+  if (!input) return fallback;
+  const token = /(\d+(?:\.\d+)?)(ms|s|m|h)/gy;
+  let consumed = 0;
+  let total = 0;
+  let match;
+  while ((match = token.exec(input)) !== null) {
+    consumed += match[0].length;
+    const unit = match[2] === "h" ? 3600000 : match[2] === "m" ? 60000 : match[2] === "s" ? 1000 : 1;
+    total += Number(match[1]) * unit;
+  }
+  return consumed === input.length && total > 0 ? total : fallback;
+}
+
+function readProjectSetting(name) {
+  if (process.env[name]) return process.env[name];
+  const envFiles = [
+    path.join(path.dirname(ROOT), ".env"),
+    path.resolve(ROOT, "../../.env"),
+  ];
+  for (const filename of envFiles) {
+    try {
+      const line = fs.readFileSync(filename, "utf8").split(/\r?\n/).find((entry) => entry.trim().startsWith(`${name}=`));
+      if (!line) continue;
+      const value = line.slice(line.indexOf("=") + 1).trim();
+      return value.replace(/^(['"])(.*)\1$/, "$2");
+    } catch {
+      // A standalone runtime is allowed to run without either optional env file.
+    }
+  }
+  return "";
+}
+
+function proxyTimeoutMs(req) {
+  const pathname = new URL(req.url || "/", "http://localhost").pathname;
+  const isGeneration = req.method === "POST" && (
+    pathname === "/api/ai/recommend" || /^\/api\/ai\/recommend\/[^/]+\/regenerate$/.test(pathname)
+  );
+  return isGeneration
+    ? Math.max(PROXY_TIMEOUT_MS, AI_RECOMMENDATION_TIMEOUT_MS + 2 * REQUEST_TIMEOUT_MS + 30000)
+    : PROXY_TIMEOUT_MS;
 }
 
 const OPEN_BROWSER = !args.includes("--no-open") && process.env.ARTSMART_OPEN !== "0";
@@ -185,6 +231,7 @@ async function serveStatic(req, res, pathname) {
  */
 function proxyApi(req, res) {
   const upstream = new URL(API_TARGET);
+  const timeout = proxyTimeoutMs(req);
   const secure = upstream.protocol === "https:";
   const transport = secure ? require("node:https") : http;
   const headers = { ...req.headers, host: upstream.host };
@@ -196,7 +243,7 @@ function proxyApi(req, res) {
       method: req.method,
       path: req.url,
       headers,
-      timeout: PROXY_TIMEOUT_MS,
+      timeout,
     },
     (upstreamRes) => {
       log(`代理 ${req.method} ${req.url} → ${API_TARGET} · ${upstreamRes.statusCode}`);
@@ -204,7 +251,7 @@ function proxyApi(req, res) {
       upstreamRes.pipe(res);
     },
   );
-  client.on("timeout", () => client.destroy(new Error(`后端 ${PROXY_TIMEOUT_MS / 1000} 秒内没有响应`)));
+  client.on("timeout", () => client.destroy(new Error(`后端 ${timeout / 1000} 秒内没有响应`)));
   client.on("error", (error) => {
     const detail = `无法连接后端 ${API_TARGET}：${error.message}`;
     log(`代理失败 ${req.method} ${req.url}：${error.message}`);

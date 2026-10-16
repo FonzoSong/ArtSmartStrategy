@@ -1,8 +1,50 @@
 package config
 
-import (
-	"testing"
-)
+import "testing"
+
+func TestLoadUsesConfigurableAIRecommendationTimeout(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgresql://localhost/arts_smart?sslmode=disable")
+	t.Setenv("APP_SECRET", "01234567890123456789012345678901")
+	t.Setenv("AI_RECOMMENDATION_TIMEOUT", "42s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.AIRecommendationTimeout.String(), "42s"; got != want {
+		t.Fatalf("AI recommendation timeout = %s, want %s", got, want)
+	}
+}
+
+func TestLoadDefaultsAIRecommendationTimeout(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgresql://localhost/arts_smart?sslmode=disable")
+	t.Setenv("APP_SECRET", "01234567890123456789012345678901")
+	t.Setenv("AI_RECOMMENDATION_TIMEOUT", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.AIRecommendationTimeout.String(), "30s"; got != want {
+		t.Fatalf("AI recommendation timeout = %s, want default %s", got, want)
+	}
+}
+
+func TestLoadRejectsAIRecommendationTimeoutOutsideSupportedRange(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgresql://localhost/arts_smart?sslmode=disable")
+	t.Setenv("APP_SECRET", "01234567890123456789012345678901")
+	t.Setenv("AI_RECOMMENDATION_TIMEOUT", "11m")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an out-of-range AI recommendation timeout to be rejected")
+	}
+}
+
+func TestLoadRejectsInvalidAIRecommendationTimeout(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgresql://localhost/arts_smart?sslmode=disable")
+	t.Setenv("APP_SECRET", "01234567890123456789012345678901")
+	t.Setenv("AI_RECOMMENDATION_TIMEOUT", "not-a-duration")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an invalid AI recommendation timeout to be rejected")
+	}
+}
 
 func TestLocalHealthURLFollowsListenAddress(t *testing.T) {
 	cases := map[string]string{
@@ -44,5 +86,33 @@ func TestHealthcheckURLDefaultsToTheDocumentedPort(t *testing.T) {
 	t.Setenv("HEALTHCHECK_URL", "")
 	if got, want := HealthcheckURL(), "http://127.0.0.1:8080/api/health/ready"; got != want {
 		t.Errorf("HealthcheckURL() = %q, want %q", got, want)
+	}
+}
+
+func TestLoadEnablesLocalAIMockMode(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgresql://localhost/arts_smart?sslmode=disable")
+	t.Setenv("APP_SECRET", "01234567890123456789012345678901")
+	t.Setenv("AI_MOCK", "")
+	t.Setenv("AI_MOCK_MODE", "true")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AIMockMode {
+		t.Fatal("AI_MOCK_MODE=true did not enable mock mode")
+	}
+}
+
+func TestLoadSupportsAIMockAndGivesItPrecedence(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgresql://localhost/arts_smart?sslmode=disable")
+	t.Setenv("APP_SECRET", "01234567890123456789012345678901")
+	t.Setenv("AI_MOCK", "true")
+	t.Setenv("AI_MOCK_MODE", "false")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AIMockMode {
+		t.Fatal("AI_MOCK=true should enable mock mode and take precedence over the legacy alias")
 	}
 }

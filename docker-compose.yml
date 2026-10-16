@@ -44,9 +44,12 @@ services:
       AI_BASE_URL: ${AI_BASE_URL:-https://api.kunyou.asia/v1}
       AI_MODEL: ${AI_MODEL:-qwen3.8-max}
       AI_API_KEY: ${AI_API_KEY:-}
+      AI_MOCK: ${AI_MOCK:-}
+      AI_MOCK_MODE: ${AI_MOCK_MODE:-false}
       DB_POOL_MAX: ${DB_POOL_MAX:-20}
       DB_POOL_MIN: ${DB_POOL_MIN:-2}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-15s}
+      AI_RECOMMENDATION_TIMEOUT: ${AI_RECOMMENDATION_TIMEOUT:-30s}
     depends_on:
       db:
         condition: service_healthy

@@ -107,6 +107,7 @@ web/
 | --- | --- | --- | --- | --- |
 | `VITE_API_BASE_URL` | 浏览器访问后端的地址；留空表示同源 `/api` | 空（推荐）；或 `http://localhost:8080`；或 `https://arts.example.com` | 否（留空即可） | 需要重启开发服务器（Vite 只在启动时读取 env） |
 | `VITE_DEV_API_TARGET` | 仅开发环境：Vite 的 `/api` 代理目标（后端地址写在这里）。裸 `host:port` 会被自动补成 `http://host:port` | `http://59.110.90.28:8080`（本仓库默认，后端在远端）；本机后端填 `http://localhost:8080`；Compose 里只有 API 时填 `http://localhost` | 否 | 需要重启开发服务器 |
+| `AI_RECOMMENDATION_TIMEOUT` | AI 排期推荐在等待模型超时后回退到本地规则；开发代理会从项目根目录 `.env` 读取此值并留出保存时间 | `30s` | 否（后端默认 `30s`） | 后端与开发服务器都需要重启 |
 
 说明：
 

@@ -15,10 +15,16 @@ import (
 
 // AdoptedSchedule is a user-approved recommendation item.
 type AdoptedSchedule struct {
-	TargetContentID string `json:"target_content_id"`
-	PlannedDate     string `json:"planned_date"`
-	TimeSlot        string `json:"time_slot"`
-	Title           string `json:"title"`
+	TargetContentID  string         `json:"target_content_id"`
+	PlannedDate      string         `json:"planned_date"`
+	TimeSlot         string         `json:"time_slot"`
+	Title            string         `json:"title"`
+	Owner            string         `json:"owner"`
+	Priority         string         `json:"priority"`
+	PriorityOrder    int            `json:"priority_order"`
+	RiskNotes        string         `json:"risk_notes"`
+	Reason           string         `json:"reason"`
+	PreviousSchedule map[string]any `json:"previous_schedule,omitempty"`
 }
 
 // Planning eligibility errors. They are distinguished from a genuine schedule
@@ -35,6 +41,7 @@ var (
 // recommendation payload looks after the adoption.
 type AdoptOutcome struct {
 	Created         int
+	Adjusted        int
 	Recommendations []map[string]any
 }
 
@@ -303,7 +310,7 @@ func scheduleRecord(ctx context.Context, tx *sql.Tx, teamID, actorID int64, requ
 func (r *Postgres) UpdateSchedule(ctx context.Context, teamID int64, id string, fields map[string]any) (map[string]any, error) {
 	// `source` and `reason` are part of the manual-adjustment record: an edited
 	// plan is marked as user-adjusted and may carry the human rationale.
-	allowed := map[string]bool{"planned_date": true, "planned_time": true, "title": true, "category": true, "platform": true, "owner": true, "source": true, "reason": true}
+	allowed := map[string]bool{"planned_date": true, "planned_time": true, "title": true, "category": true, "platform": true, "owner": true, "source": true, "reason": true, "priority": true, "priority_order": true, "risk_notes": true}
 	args := []any{}
 	assignments := []string{}
 	for key, value := range fields {
@@ -444,6 +451,8 @@ func (r *Postgres) AdoptRecommendations(ctx context.Context, teamID, actorID int
 	}
 	existing.Close()
 	adoptedScheduleIDs := map[string]string{}
+	appliedItems := map[string]AdoptedSchedule{}
+	created, adjusted := 0, 0
 	for _, item := range items {
 		if !allowedIDs[item.TargetContentID] {
 			return AdoptOutcome{}, errors.New("采纳内容不属于此排期建议")
@@ -461,15 +470,39 @@ func (r *Postgres) AdoptRecommendations(ctx context.Context, teamID, actorID int
 		if lifecycle != domain.LifecycleUnpublished || state == domain.WorkflowPublished {
 			return AdoptOutcome{}, ErrNotUnpublished
 		}
-		if !domain.CanSuggestSchedule(lifecycle, state) {
+		var currentScheduleID string
+		currentErr := tx.QueryRowContext(ctx, `SELECT id FROM schedule WHERE team_id=$1 AND content_id=$2 AND status='待发布' FOR UPDATE`, teamID, item.TargetContentID).Scan(&currentScheduleID)
+		hasCurrent := currentErr == nil
+		if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
+			return AdoptOutcome{}, currentErr
+		}
+		if hasCurrent != (item.PreviousSchedule != nil) {
+			return AdoptOutcome{}, errors.New("内容当前排期已变化，请重新生成或检查排期日历")
+		}
+		if !hasCurrent && !domain.CanSuggestSchedule(lifecycle, state) {
 			return AdoptOutcome{}, ErrNotSuggestionReady
 		}
-		var duplicate bool
-		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schedule WHERE team_id=$1 AND content_id=$2 AND status='待发布')`, teamID, item.TargetContentID).Scan(&duplicate); err != nil {
-			return AdoptOutcome{}, err
+		if hasCurrent && (state != domain.WorkflowScheduled || stringValue(item.PreviousSchedule["id"]) != currentScheduleID) {
+			return AdoptOutcome{}, errors.New("现有排期与建议冲突信息不一致")
 		}
-		if duplicate {
-			return AdoptOutcome{}, errors.New("该内容已有排期，请先调整或取消原排期")
+		if hasCurrent {
+			adjusted++
+			var oldDate, oldTime, oldTitle, oldCategory, oldPlatform, oldOwner, oldReason, oldSource, oldPriority, oldRisk, oldRecID string
+			var oldPriorityOrder int
+			if err = tx.QueryRowContext(ctx, `SELECT to_char(planned_date,'YYYY-MM-DD'),planned_time,title,category,platform,owner,reason,source,priority,priority_order,risk_notes,COALESCE(recommendation_id,'') FROM schedule WHERE id=$1 AND team_id=$2`, currentScheduleID, teamID).Scan(&oldDate, &oldTime, &oldTitle, &oldCategory, &oldPlatform, &oldOwner, &oldReason, &oldSource, &oldPriority, &oldPriorityOrder, &oldRisk, &oldRecID); err != nil {
+				return AdoptOutcome{}, err
+			}
+			previous := item.PreviousSchedule
+			if oldDate != stringValue(previous["planned_date"]) || oldTime != stringValue(previous["planned_time"]) || oldTitle != stringValue(previous["title"]) || oldCategory != stringValue(previous["category"]) || oldPlatform != stringValue(previous["platform"]) || oldOwner != stringValue(previous["owner"]) || oldReason != stringValue(previous["reason"]) || oldSource != stringValue(previous["source"]) || oldPriority != defaultPriority(stringValue(previous["priority"])) || oldPriorityOrder != intValue(previous["priority_order"]) || oldRisk != stringValue(previous["risk_notes"]) || oldRecID != stringValue(previous["recommendation_id"]) {
+				return AdoptOutcome{}, errors.New("现有排期已变化，请刷新后重试")
+			}
+			oldParsed, parseErr := time.Parse("2006-01-02", oldDate)
+			if parseErr != nil {
+				return AdoptOutcome{}, parseErr
+			}
+			dayCounts[oldDate]--
+			oldYear, oldWeek := oldParsed.ISOWeek()
+			weekCounts[fmt.Sprintf("%s:%d:%d", oldPlatform, oldYear, oldWeek)]--
 		}
 		dayCounts[item.PlannedDate]++
 		planned, parseErr := time.Parse("2006-01-02", date)
@@ -488,12 +521,38 @@ func (r *Postgres) AdoptRecommendations(ctx context.Context, teamID, actorID int
 		if item.Title == "" {
 			item.Title = title
 		}
+		if item.Owner == "" {
+			item.Owner = owner
+		}
+		if item.Priority == "" {
+			item.Priority = "medium"
+		}
+		if item.Priority != "high" && item.Priority != "medium" && item.Priority != "low" {
+			return AdoptOutcome{}, errors.New("排期优先级无效")
+		}
+		if item.PriorityOrder <= 0 {
+			item.PriorityOrder = 1
+		}
 		var scheduleID string
-		err = tx.QueryRowContext(ctx, `INSERT INTO schedule(id,team_id,recommendation_id,content_id,planned_date,planned_time,title,category,platform,owner,reason,status,source,created_by_user_id,created_at,updated_at) VALUES($1,$2,$3,$4,$5::date,$6,$7,$8,$9,$10,'采纳排期建议','待发布','auto',$11,NOW(),NOW()) RETURNING id`, newUUID(), teamID, recommendationID, item.TargetContentID, item.PlannedDate, item.TimeSlot, item.Title, category, platform, owner, actorID).Scan(&scheduleID)
+		reason := strings.TrimSpace(item.Reason)
+		if reason == "" {
+			reason = "采纳排期建议"
+		}
+		if hasCurrent {
+			scheduleID = currentScheduleID
+			_, err = tx.ExecContext(ctx, `UPDATE schedule SET recommendation_id=$1,planned_date=$2::date,planned_time=$3,title=$4,owner=$5,reason=$6,source='auto',priority=$7,priority_order=$8,risk_notes=$9,updated_at=NOW() WHERE id=$10 AND team_id=$11`, recommendationID, item.PlannedDate, item.TimeSlot, item.Title, item.Owner, reason, item.Priority, item.PriorityOrder, item.RiskNotes, scheduleID, teamID)
+			if err == nil {
+				err = insertAudit(ctx, tx, teamID, actor, "adjust_schedule", "schedule", scheduleID, "AI 排期建议调整现有排期")
+			}
+		} else {
+			created++
+			err = tx.QueryRowContext(ctx, `INSERT INTO schedule(id,team_id,recommendation_id,content_id,planned_date,planned_time,title,category,platform,owner,reason,status,source,priority,priority_order,risk_notes,created_by_user_id,created_at,updated_at) VALUES($1,$2,$3,$4,$5::date,$6,$7,$8,$9,$10,$11,'待发布','auto',$12,$13,$14,$15,NOW(),NOW()) RETURNING id`, newUUID(), teamID, recommendationID, item.TargetContentID, item.PlannedDate, item.TimeSlot, item.Title, category, platform, item.Owner, reason, item.Priority, item.PriorityOrder, item.RiskNotes, actorID).Scan(&scheduleID)
+		}
 		if err != nil {
 			return AdoptOutcome{}, err
 		}
 		adoptedScheduleIDs[item.TargetContentID] = scheduleID
+		appliedItems[item.TargetContentID] = item
 		if state != domain.WorkflowScheduled {
 			if _, err = tx.ExecContext(ctx, `UPDATE content SET workflow_state=$1,updated_at=NOW() WHERE id=$2 AND team_id=$3`, domain.WorkflowScheduled, item.TargetContentID, teamID); err != nil {
 				return AdoptOutcome{}, err
@@ -506,6 +565,9 @@ func (r *Postgres) AdoptRecommendations(ctx context.Context, teamID, actorID int
 			return AdoptOutcome{}, err
 		}
 	}
+	if err = insertAudit(ctx, tx, teamID, actor, "apply_schedule_recommendation", "recommendation", recommendationID, fmt.Sprintf("采纳 %d 条排期建议", len(items))); err != nil {
+		return AdoptOutcome{}, err
+	}
 	// Keep remaining suggestions intact and mark only the adopted ones, so a
 	// single adoption never hides or resets the rest of the group.
 	for _, item := range saved.Recommendations {
@@ -513,6 +575,20 @@ func (r *Postgres) AdoptRecommendations(ctx context.Context, teamID, actorID int
 		if scheduleID, ok := adoptedScheduleIDs[contentID]; ok {
 			item["adopted"] = true
 			item["schedule_id"] = scheduleID
+			applied := appliedItems[contentID]
+			item["planned_date"] = applied.PlannedDate
+			if planned, parseErr := time.Parse("2006-01-02", applied.PlannedDate); parseErr == nil {
+				item["day_of_week"] = domain.WeekdayLabel(planned.Weekday())
+			}
+			item["time_slot"] = applied.TimeSlot
+			item["title"] = applied.Title
+			item["owner"] = applied.Owner
+			item["priority"] = defaultPriority(applied.Priority)
+			item["priority_order"] = applied.PriorityOrder
+			item["risk_notes"] = applied.RiskNotes
+			if applied.PreviousSchedule != nil {
+				item["previous_schedule"] = applied.PreviousSchedule
+			}
 		}
 	}
 	updatedPayload, err := json.Marshal(map[string]any{"recommendations": saved.Recommendations})
@@ -525,7 +601,144 @@ func (r *Postgres) AdoptRecommendations(ctx context.Context, teamID, actorID int
 	if err = tx.Commit(); err != nil {
 		return AdoptOutcome{}, err
 	}
-	return AdoptOutcome{Created: len(items), Recommendations: saved.Recommendations}, nil
+	return AdoptOutcome{Created: created, Adjusted: adjusted, Recommendations: saved.Recommendations}, nil
+}
+
+// RevertRecommendation undoes schedules created or adjusted by one saved
+// recommendation. It refuses to overwrite a plan that someone changed after
+// application, and applies the whole revert in one transaction.
+func (r *Postgres) RevertRecommendation(ctx context.Context, teamID, actorID int64, actor, recommendationID string) (int, error) {
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var stored string
+	if err = tx.QueryRowContext(ctx, `SELECT payload_json FROM recommendation WHERE id=$1 AND team_id=$2 FOR UPDATE`, recommendationID, teamID).Scan(&stored); err != nil {
+		return 0, err
+	}
+	var saved struct {
+		Recommendations []map[string]any `json:"recommendations"`
+	}
+	if err = json.Unmarshal([]byte(stored), &saved); err != nil {
+		return 0, errors.New("排期建议记录格式无效")
+	}
+	type appliedItem struct {
+		row                   map[string]any
+		scheduleID, contentID string
+		previous              map[string]any
+	}
+	applied := make([]appliedItem, 0)
+	for _, row := range saved.Recommendations {
+		if row["adopted"] != true {
+			continue
+		}
+		scheduleID, _ := row["schedule_id"].(string)
+		contentID, _ := row["target_content_id"].(string)
+		previous, _ := row["previous_schedule"].(map[string]any)
+		if scheduleID == "" || contentID == "" {
+			return 0, errors.New("已采纳建议缺少排期记录，无法撤回")
+		}
+		applied = append(applied, appliedItem{row: row, scheduleID: scheduleID, contentID: contentID, previous: previous})
+	}
+	if len(applied) == 0 {
+		return 0, errors.New("该排期建议没有可撤回的已采纳条目")
+	}
+	// Validate every target before writing so a conflict cannot leave a partial revert.
+	for _, item := range applied {
+		var contentID, status, source, storedRecommendationID, date, clock, title, owner, priority, risk, reason string
+		var priorityOrder int
+		if err = tx.QueryRowContext(ctx, `SELECT content_id,status,source,COALESCE(recommendation_id,''),to_char(planned_date,'YYYY-MM-DD'),planned_time,title,owner,priority,priority_order,risk_notes,reason FROM schedule WHERE id=$1 AND team_id=$2 FOR UPDATE`, item.scheduleID, teamID).Scan(&contentID, &status, &source, &storedRecommendationID, &date, &clock, &title, &owner, &priority, &priorityOrder, &risk, &reason); err != nil {
+			return 0, err
+		}
+		if contentID != item.contentID || status != "待发布" || storedRecommendationID != recommendationID {
+			return 0, errors.New("已应用排期已发布或关联内容变化，无法安全撤回")
+		}
+		if source != "auto" || stringValue(item.row["planned_date"]) != date || stringValue(item.row["time_slot"]) != clock || stringValue(item.row["title"]) != title || stringValue(item.row["owner"]) != owner || stringValue(item.row["priority"]) != priority || intValue(item.row["priority_order"]) != priorityOrder || stringValue(item.row["risk_notes"]) != risk || stringValue(item.row["reason"]) != reason {
+			return 0, errors.New("排期在采纳后已被修改，请先恢复当前排期或保留现状")
+		}
+		if item.previous != nil && stringValue(item.previous["id"]) != item.scheduleID {
+			return 0, errors.New("原排期快照与当前排期不一致，无法撤回")
+		}
+		if item.previous == nil && (storedRecommendationID != recommendationID || source != "auto") {
+			return 0, errors.New("该排期不再是此建议创建的自动排期，无法安全撤回")
+		}
+		var workflowState string
+		if err = tx.QueryRowContext(ctx, `SELECT workflow_state FROM content WHERE id=$1 AND team_id=$2 FOR UPDATE`, item.contentID, teamID).Scan(&workflowState); err != nil {
+			return 0, err
+		}
+		if workflowState != domain.WorkflowScheduled {
+			return 0, errors.New("内容工作流状态已变化，无法安全撤回")
+		}
+	}
+	for _, item := range applied {
+		var restoreState string
+		if item.previous != nil {
+			previous := item.previous
+			restoreState = domain.WorkflowScheduled
+			_, err = tx.ExecContext(ctx, `UPDATE schedule SET recommendation_id=NULLIF($1,''),planned_date=$2::date,planned_time=$3,title=$4,category=$5,platform=$6,owner=$7,reason=$8,source=$9,priority=$10,priority_order=$11,risk_notes=$12,updated_at=NOW() WHERE id=$13 AND team_id=$14`, stringValue(previous["recommendation_id"]), stringValue(previous["planned_date"]), stringValue(previous["planned_time"]), stringValue(previous["title"]), stringValue(previous["category"]), stringValue(previous["platform"]), stringValue(previous["owner"]), stringValue(previous["reason"]), stringValue(previous["source"]), defaultPriority(stringValue(previous["priority"])), intValue(previous["priority_order"]), stringValue(previous["risk_notes"]), item.scheduleID, teamID)
+		} else {
+			restoreState = domain.WorkflowSchedulePending
+			_, err = tx.ExecContext(ctx, `DELETE FROM schedule WHERE id=$1 AND team_id=$2 AND recommendation_id=$3`, item.scheduleID, teamID, recommendationID)
+		}
+		if err != nil {
+			return 0, err
+		}
+		if restoreState != domain.WorkflowScheduled {
+			if _, err = tx.ExecContext(ctx, `UPDATE content SET workflow_state=$1,updated_at=NOW() WHERE id=$2 AND team_id=$3`, restoreState, item.contentID, teamID); err != nil {
+				return 0, err
+			}
+			if _, err = tx.ExecContext(ctx, `INSERT INTO content_workflow_event(team_id,content_id,from_state,to_state,source,actor_user_id,created_at) VALUES($1,$2,$3,$4,'system',$5,NOW())`, teamID, item.contentID, domain.WorkflowScheduled, restoreState, actorID); err != nil {
+				return 0, err
+			}
+		}
+		row := item.row
+		row["adopted"] = false
+		delete(row, "schedule_id")
+		delete(row, "previous_schedule")
+		if err = insertAudit(ctx, tx, teamID, actor, "revert_schedule", "schedule", item.scheduleID, "撤回 AI 排期建议的应用"); err != nil {
+			return 0, err
+		}
+	}
+	updatedPayload, err := json.Marshal(map[string]any{"recommendations": saved.Recommendations})
+	if err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE recommendation SET payload_json=$1,adopted=FALSE WHERE id=$2 AND team_id=$3`, string(updatedPayload), recommendationID, teamID); err != nil {
+		return 0, err
+	}
+	if err = insertAudit(ctx, tx, teamID, actor, "revert_schedule_recommendation", "recommendation", recommendationID, fmt.Sprintf("撤回 %d 条已应用排期", len(applied))); err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(applied), nil
+}
+
+func stringValue(value any) string { text, _ := value.(string); return text }
+
+func intValue(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return int(parsed)
+	default:
+		return 0
+	}
+}
+
+func defaultPriority(value string) string {
+	if value == "high" || value == "low" {
+		return value
+	}
+	return "medium"
 }
 
 // ParseScheduleDate validates an ISO date string before SQL interpolation.

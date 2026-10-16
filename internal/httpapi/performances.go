@@ -162,6 +162,9 @@ func describeScheduleRow(row map[string]any) string {
 	if owner := stringField(row, "owner"); owner != "" {
 		parts = append(parts, "负责人 "+owner)
 	}
+	if priority := stringField(row, "priority"); priority != "" {
+		parts = append(parts, "优先级 "+priority)
+	}
 	kept := make([]string, 0, len(parts))
 	for _, part := range parts {
 		if part != "" {

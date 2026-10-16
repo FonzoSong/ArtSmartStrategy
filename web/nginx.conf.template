@@ -34,6 +34,10 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 75s;
+        # The backend owns the real AI wait limit through
+        # AI_RECOMMENDATION_TIMEOUT. Keep the proxy above the supported maximum
+        # (10m AI wait + two 60s request windows + response headroom) so it cannot cut off fallback
+        # persistence before the API returns.
+        proxy_read_timeout 13m;
     }
 }

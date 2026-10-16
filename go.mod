@@ -3,6 +3,7 @@ module github.com/arts-smart/strategy
 go 1.26.8
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/go-pdf/fpdf v0.9.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.2

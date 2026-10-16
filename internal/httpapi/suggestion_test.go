@@ -118,3 +118,16 @@ func TestConsumeSlotTracksDailyAndWeeklyLoad(t *testing.T) {
 		}
 	}
 }
+
+func TestMockAIRecommendationsAreClearlyMarkedAndPrioritized(t *testing.T) {
+	items := mockAIRecommendations([]service.Suggestion{{TargetContentID: "first"}, {TargetContentID: "second"}, {TargetContentID: "third"}})
+	if len(items) != 3 {
+		t.Fatalf("mock recommendations=%d, want 3", len(items))
+	}
+	if items[0].SuggestionSource != "AI 模拟" || items[0].Priority != "high" || items[0].PriorityOrder != 1 {
+		t.Fatalf("first mock item=%#v", items[0])
+	}
+	if items[2].Priority != "low" || items[2].ConfidenceScore <= 0 || items[2].RiskNotes == "" {
+		t.Fatalf("mock output lacks required fields: %#v", items[2])
+	}
+}

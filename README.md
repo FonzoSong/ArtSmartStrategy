@@ -22,7 +22,12 @@ Docker Compose PostgreSQL。浏览器仅通过同源 `/api` 访问后端；数�
 
 安装 Docker Desktop（含 Compose v2），将 `.env.example` 复制为 `.env`，配置
 `POSTGRES_ADMIN_PASSWORD`、`APP_DB_PASSWORD` 和至少 32 字符的 `APP_SECRET`。可选配置
-`AI_API_KEY`；密钥只从后端环境注入，不会回显给浏览器。`TZ`（默认 `Asia/Shanghai`）决定
+`AI_API_KEY`；密钥只从后端环境注入，不会回显给浏览器。开发时可设置 `AI_MOCK=true`
+启用可重复的本地模拟建议，不会调用外部模型；默认关闭。排期建议按目标内容的共享 Tag
+筛选同团队已发布样本，并将点赞、播放、评论、收藏、转发、完播率和已有转化指标交给模型。
+API 会严格校验模型 JSON、内容 ID、优先级、置信度和排期规则；生成、修改、应用与撤回都会写入操作审计。
+AI 排期接口及请求示例见 [AI scheduling recommendations](docs/AI_SCHEDULING_RECOMMENDATIONS.md)。
+`TZ`（默认 `Asia/Shanghai`）决定
 正式演出的“已开演”判定与日期渲染，团队不在东八区时请一并调整。
 
 ```text

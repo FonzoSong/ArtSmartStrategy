@@ -148,6 +148,8 @@ VARCHAR(100)、`created_at`。数据产生：`POST /api/auth/setup`、`POST /api
 | title / category / platform / owner / reason | VARCHAR, TEXT | 计划展示字段与推荐理由 |
 | status | VARCHAR(20) | `待发布` / `已复盘` |
 | source | VARCHAR(20) | `auto`（生成或采纳）或 `manual`（人工创建或调整） |
+| priority / priority_order | VARCHAR(12), INTEGER | 优先级（`high` / `medium` / `low`）及推荐顺序 |
+| risk_notes | TEXT | 采纳前需确认的风险或冲突说明 |
 | created_by_user_id | INTEGER FK→user_account | 操作人 |
 | actual_views … actual_completion | INTEGER, FLOAT | 回填的实际数据（可空） |
 | prediction_views_low / high | INTEGER | 预测区间（可空） |
@@ -155,16 +157,18 @@ VARCHAR(100)、`created_at`。数据产生：`POST /api/auth/setup`、`POST /api
 
 数据产生：`POST /api/schedule/manual`、`POST /api/schedule/manual-batch`、
 `POST /api/schedule/adopt`（事务内校验）、`PATCH /api/schedule/{id}`（人工调整，同时写
-`audit_log`）、`POST /api/schedule/{id}/publish`（回填实际数据并同步内容资产）。
+`audit_log`）、`POST /api/schedule/{id}/publish`（回填实际数据并同步内容资产）。建议生成应用可通过
+`POST /api/recommendations/{id}/revert` 原子撤回；新增排期会删除并恢复内容到待排期，调整既有排期会恢复快照。
 
 ### recommendation（排期建议）
 
 业务用途：一次排期建议生成的结果快照。字段：`id`（VARCHAR(36) PK）、`team_id`（FK→team）、
 `generated_at`、`payload_json`（`{"recommendations":[…]}`，整场排期额外带
 `performance_id`）、`source_model`、`source_label`、`confidence`、`reference_count`、
-`analysis_status`（如 `ai_completed`/`rule_fallback`/`performance_plan`/`no_candidates`）、
-`fallback_reason`、`adopted`。数据产生：`POST /api/ai/recommend`、
-`POST /api/performances/{id}/plan`、`PATCH /api/recommendations/{id}`。
+`analysis_status`（如 `ai_completed`/`ai_mock`/`rule_fallback`/`performance_plan`/`no_candidates`）、
+`fallback_reason`、`adopted`。排期建议只向模型提供待排期内容共享 Tag 的已发布样本；建议项包括日期、时间、优先级、顺序、理由、置信度、Tag、风险说明和撤回所需的原排期快照。数据产生：`POST /api/ai/recommend`、
+`POST /api/performances/{id}/plan`、`PATCH /api/recommendations/{id}`、
+`POST /api/recommendations/{id}/revert`。
 
 ### content_rule_set（自定义规则集）
 

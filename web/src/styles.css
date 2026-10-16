@@ -272,3 +272,16 @@ body.auth-mode .main-area{margin-left:0;width:100%}body.auth-mode .topbar-right{
 .test-account .form-help{line-height:1.7;margin:0}
 .test-account .form-help.warn{color:#a8703c}
 .test-account .form-help.ok{color:#5f7a4f}
+
+/* AI schedule recommendations: keep the existing paper-and-ink card language,
+   while giving performance evidence and editable controls room to scan. */
+.suggestion-card .suggestion-copy p{font-size:11px;line-height:1.6}
+.suggestion-card .suggestion-meta{align-items:center;gap:9px}
+.suggestion-card .suggestion-meta span{font-size:11px;line-height:1.45}
+.suggestion-card .suggestion-meta label{display:grid;gap:4px;color:var(--muted);font-size:11px}
+.suggestion-card .suggestion-meta input,.suggestion-card .suggestion-meta select{min-height:34px;font-size:12px}
+.suggestion-card .reason-box{font-size:11px;line-height:1.7}
+.suggestion-card .day-badge small{font-size:10px}
+.suggestion-card :is(input,select,button,[contenteditable="true"]):focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+.suggestion-card [contenteditable="true"]{border-radius:3px}
+@media(prefers-reduced-motion:reduce){.suggestion-card :is(.btn-primary,.btn-secondary){transition:none}.suggestion-card .btn-primary:hover{transform:none}}

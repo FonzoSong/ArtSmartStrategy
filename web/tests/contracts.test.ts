@@ -88,12 +88,16 @@ test("adoption and diagnostics keep their empty-team shape", () => {
 
 test("schedule rows keep planned_date a pure calendar date", () => {
   const rows = normalizeScheduleList([
-    { id: "s1", content_id: "c1", planned_date: "2026-10-12T00:00:00Z", planned_time: "19:30", status: "待发布", title: "标题", platform: "视频号" },
+    { id: "s1", content_id: "c1", planned_date: "2026-10-12T00:00:00Z", planned_time: "19:30", status: "待发布", title: "标题", platform: "视频号", priority: "high", priority_order: 2, risk_notes: "时间冲突" },
     { id: "s2", planned_date: null },
   ]);
   assert.equal(rows.length, 2);
   assert.equal(rows[0].planned_date, "2026-10-12");
+  assert.equal(rows[0].priority, "high");
+  assert.equal(rows[0].priority_order, 2);
+  assert.equal(rows[0].risk_notes, "时间冲突");
   assert.equal(rows[1].planned_date, "");
+  assert.equal(rows[1].priority, "medium");
   assert.equal(rows[1].title, "");
   assert.equal(rows[1].status, "");
   assert.deepEqual(normalizeScheduleList({ items: [] }), []);
@@ -150,9 +154,13 @@ test("suggestion payloads carry validity, adoption state and pure dates", () => 
     id: "rec-1",
     source_label: "本地规则引擎",
     reference_count: 4,
+    strategy: "balanced",
+    model: "rules",
+    summary: "为 1 条内容生成建议。",
+    conflicts: [{ type: "insufficient_samples", severity: "warning", content_id: "c1", message: "样本有限" }],
     recommendations: [
       { target_content_id: "c1", title: "标题", planned_date: "2026-10-12T00:00:00Z", time_slot: "19:30", adopted: true, schedule_id: "s1", reference_sample_count: 2 },
-      { target_content_id: "c2", planned_date: "bad", invalid_reason: "计划日期超出规则集排期周期" },
+      { target_content_id: "c2", planned_date: "bad", invalid_reason: "计划日期超出规则集排期周期", priority: "high", priority_order: 1, confidence_score: 0.83, tags: ["演出"], risk_notes: "窗口冲突", previous_schedule: { id: "s0", recommendation_id: "rec-old", planned_date: "2026-10-11", priority: "low", priority_order: 4 } },
     ],
   });
   assert.equal(payload.recommendations.length, 2);
@@ -162,6 +170,17 @@ test("suggestion payloads carry validity, adoption state and pure dates", () => 
   assert.equal(payload.recommendations[1].planned_date, "");
   assert.equal(payload.recommendations[1].invalid_reason, "计划日期超出规则集排期周期");
   assert.equal(payload.recommendations[1].adopted, false);
+  assert.equal(payload.recommendations[1].priority, "high");
+  assert.equal(payload.recommendations[1].priority_order, 1);
+  assert.equal(payload.recommendations[1].confidence_score, 0.83);
+  assert.deepEqual(payload.recommendations[1].tags, ["演出"]);
+  assert.equal(payload.recommendations[1].previous_schedule?.priority, "low");
+  assert.equal(payload.recommendations[1].previous_schedule?.planned_date, "2026-10-11");
+  assert.equal(payload.strategy, "balanced");
+  assert.equal(payload.model, "rules");
+  assert.equal(payload.summary, "为 1 条内容生成建议。");
+  assert.equal(payload.conflicts[0].type, "insufficient_samples");
+  assert.equal(payload.conflicts[0].content_id, "c1");
   assert.deepEqual(normalizeSuggestionPayload(undefined).recommendations, []);
 });
 
@@ -169,6 +188,11 @@ test("response normalization is dispatched per endpoint", () => {
   const overview = normalizeAPIResponse("/api/stats/overview?team=1", { total_views: 5 });
   assert.equal((overview as { total_views: number }).total_views, 5);
   assert.deepEqual((overview as { top_contents: unknown[] }).top_contents, []);
+  const detail = normalizeAPIResponse("/api/ai/recommend/rec-1", { id: "rec-1", strategy: "balanced", conflicts: [] });
+  assert.equal((detail as { strategy: string }).strategy, "balanced");
+  const applied = normalizeAPIResponse("/api/ai/recommend/rec-1/apply", { created: 2, adjusted: 1, recommendations: [] });
+  assert.equal((applied as { created: number }).created, 2);
+  assert.equal((applied as { adjusted: number }).adjusted, 1);
 
   const schedule = normalizeAPIResponse("/api/schedule", [{ planned_date: "2026-10-12T00:00:00Z" }]);
   assert.equal((schedule as { planned_date: string }[])[0].planned_date, "2026-10-12");
@@ -176,8 +200,9 @@ test("response normalization is dispatched per endpoint", () => {
   const single = normalizeAPIResponse("/api/schedule/abc", { planned_date: "2026-11-01T00:00:00Z", status: "待发布" });
   assert.equal((single as { planned_date: string }).planned_date, "2026-11-01");
 
-  const adopt = normalizeAPIResponse("/api/schedule/adopt", { created: "2", recommendations: [{ target_content_id: "c1", adopted: true }] });
+  const adopt = normalizeAPIResponse("/api/schedule/adopt", { created: "2", adjusted: "1", recommendations: [{ target_content_id: "c1", adopted: true }] });
   assert.equal((adopt as { created: number }).created, 2);
+  assert.equal((adopt as { adjusted: number }).adjusted, 1);
   assert.equal((adopt as { recommendations: { adopted: boolean }[] }).recommendations[0].adopted, true);
 
   const untouched = { anything: true };

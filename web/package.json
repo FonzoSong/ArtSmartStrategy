@@ -5,12 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
+    "lint": "eslint src/app.ts src/lib/suggestions.ts tests/suggestions.test.ts",
     "test": "node --test",
     "typecheck": "tsc --noEmit",
     "build": "vite build"
   },
   "devDependencies": {
+    "eslint": "^10.13.0",
     "typescript": "^5.7.3",
+    "typescript-eslint": "^8.71.2",
     "vite": "^6.0.7"
   }
 }

@@ -37,6 +37,10 @@ function asRecords(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value) ? value.filter(isRecord) : [];
 }
 
+function asStrings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
 export interface OverviewTopContent {
   id: string;
   title: string;
@@ -286,8 +290,12 @@ export interface ScheduleRow {
   platform: string;
   owner: string;
   reason: string;
+  priority: string;
+  priority_order: number;
+  risk_notes: string;
   status: string;
   source: string;
+  recommendation_id: string;
   source_label: string;
   operator: string;
 }
@@ -305,8 +313,12 @@ export function normalizeScheduleRow(payload: unknown): ScheduleRow {
     platform: asString(source.platform),
     owner: asString(source.owner),
     reason: asString(source.reason),
+    priority: asString(source.priority) || "medium",
+    priority_order: asNumber(source.priority_order),
+    risk_notes: asString(source.risk_notes),
     status: asString(source.status),
     source: asString(source.source),
+    recommendation_id: asString(source.recommendation_id),
     source_label: asString(source.source_label),
     operator: asString(source.operator),
   };
@@ -555,10 +567,32 @@ export interface Suggestion {
   suggestion_source: string;
   reference_sample_count: number;
   confidence: string;
+  confidence_score: number;
   limitations: string;
+  priority_order: number;
+  priority: string;
+  risk_notes: string;
+  tags: string[];
   invalid_reason: string;
   adopted: boolean;
   schedule_id: string;
+  previous_schedule: ScheduleSnapshot | null;
+}
+
+export interface ScheduleSnapshot {
+  id: string;
+  recommendation_id: string;
+  planned_date: string;
+  planned_time: string;
+  title: string;
+  category: string;
+  platform: string;
+  owner: string;
+  reason: string;
+  source: string;
+  priority: string;
+  priority_order: number;
+  risk_notes: string;
 }
 
 /** Normalizes one schedule suggestion. */
@@ -577,10 +611,30 @@ export function normalizeSuggestionItem(payload: unknown): Suggestion {
     suggestion_source: asString(source.suggestion_source),
     reference_sample_count: asNumber(source.reference_sample_count),
     confidence: asString(source.confidence),
+    confidence_score: asNumber(source.confidence_score),
     limitations: asString(source.limitations),
+    priority_order: asNumber(source.priority_order),
+    priority: asString(source.priority) || "medium",
+    risk_notes: asString(source.risk_notes),
+    tags: asStrings(source.tags),
     invalid_reason: asString(source.invalid_reason),
     adopted: source.adopted === true,
     schedule_id: asString(source.schedule_id),
+    previous_schedule: isRecord(source.previous_schedule) ? {
+      id: asString(source.previous_schedule.id),
+      recommendation_id: asString(source.previous_schedule.recommendation_id),
+      planned_date: pureDateKey(source.previous_schedule.planned_date),
+      planned_time: asString(source.previous_schedule.planned_time),
+      title: asString(source.previous_schedule.title),
+      category: asString(source.previous_schedule.category),
+      platform: asString(source.previous_schedule.platform),
+      owner: asString(source.previous_schedule.owner),
+      reason: asString(source.previous_schedule.reason),
+      source: asString(source.previous_schedule.source),
+      priority: asString(source.previous_schedule.priority) || "medium",
+      priority_order: asNumber(source.previous_schedule.priority_order),
+      risk_notes: asString(source.previous_schedule.risk_notes),
+    } : null,
   };
 }
 
@@ -589,10 +643,14 @@ export interface SuggestionPayload {
   source: string;
   source_label: string;
   analysis_status: string;
+  strategy: string;
+  model: string;
   reference_count: number;
   confidence: string;
   confidence_note: string;
   fallback_reason: string;
+  summary: string;
+  conflicts: Array<{ type: string; severity: string; content_id: string; message: string }>;
   recommendations: Suggestion[];
 }
 
@@ -604,10 +662,19 @@ export function normalizeSuggestionPayload(payload: unknown): SuggestionPayload 
     source: asString(source.source),
     source_label: asString(source.source_label) || asString(source.source),
     analysis_status: asString(source.analysis_status),
+    strategy: asString(source.strategy),
+    model: asString(source.model) || asString(source.source_model),
     reference_count: asNumber(source.reference_count),
     confidence: asString(source.confidence),
     confidence_note: asString(source.confidence_note),
     fallback_reason: asString(source.fallback_reason),
+    summary: asString(source.summary),
+    conflicts: asRecords(source.conflicts).map((conflict) => ({
+      type: asString(conflict.type),
+      severity: asString(conflict.severity),
+      content_id: asString(conflict.content_id),
+      message: asString(conflict.message),
+    })),
     recommendations: asRecords(source.recommendations).map(normalizeSuggestionItem),
   };
 }
@@ -671,16 +738,23 @@ export function normalizeAPIResponse(path: string, payload: unknown): unknown {
   if (/^\/api\/recommendations\/[^/]+$/.test(pathname)) {
     return normalizeSuggestionPayload(payload);
   }
+  if (/^\/api\/ai\/recommend\/[^/]+$/.test(pathname) || /^\/api\/ai\/recommend\/[^/]+\/regenerate$/.test(pathname)) {
+    return normalizeSuggestionPayload(payload);
+  }
+  if (/^\/api\/ai\/recommend\/[^/]+\/apply$/.test(pathname)) {
+    return normalizeAdoptResult(payload);
+  }
   return payload;
 }
 
 export interface AdoptResult {
   created: number;
+  adjusted: number;
   recommendations: Suggestion[];
 }
 
 /** Normalizes the adoption response, which reports what was written. */
 export function normalizeAdoptResult(payload: unknown): AdoptResult {
   const source = isRecord(payload) ? payload : {};
-  return { created: asNumber(source.created), recommendations: asRecords(source.recommendations).map(normalizeSuggestionItem) };
+  return { created: asNumber(source.created), adjusted: asNumber(source.adjusted), recommendations: asRecords(source.recommendations).map(normalizeSuggestionItem) };
 }
