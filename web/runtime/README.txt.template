@@ -2,30 +2,40 @@
 ============================================================
 
 这是什么
-  web/out 是 web/make.sh 生成的“自包含”前端产物：编译后的 JS、样式、
-  图片、以及一个只依赖 Node 内置模块的静态服务器。拷贝到任意 Windows
-  机器上都能运行，不需要 npm install、不需要 Docker、不需要 WSL。
+  web/out 是 web/make.sh 生成的“自包含”前端产物：编译后的 JS、样式、图片，
+  外加一个随包携带的 Windows 版 Node 运行时（node\node.exe）和一个零依赖的
+  静态服务器（server.js）。拷贝到任意 Windows 机器上都能运行，
+  不需要安装 Node.js、不需要 npm install、不需要 Docker / WSL、不需要管理员权限。
 
 怎么启动（Windows）
-  1. 安装 Node.js 20 或更高版本（https://nodejs.org/），确保 node 在 PATH 里。
-  2. 双击本目录下的 start.bat。
-  3. 服务就绪后浏览器会自动打开 http://localhost:8080/ 。
+  1. 把整个 out 目录拷到目标机器（任意路径，含中文路径也行）。
+  2. 双击 start.bat。
+     它会优先使用随包的 node\node.exe；找不到时才回退到系统 PATH 里的 Node.js。
+  3. 服务就绪后浏览器自动打开 http://localhost:8080/ 。
      端口 8080 被占用时会自动顺延到 8081、8082 …，实际地址打印在窗口里。
   4. 停止服务：在窗口里按 Ctrl+C（脚本结尾有 pause，窗口不会闪退）。
 
 怎么启动（命令行 / 非 Windows）
   cd 到本目录后执行：
-    node server.js                 # 默认 8080，自动顺延，自动开浏览器
-    node server.js --port 9000     # 指定起始端口
-    node server.js --no-open       # 不开浏览器（服务器/CI 场景）
+    node server.js                # 用当前 PATH 里的 node（默认 8080，自动顺延）
+    node server.js --port 9000    # 指定起始端口
+    node server.js --no-open      # 不开浏览器（服务器/CI 场景）
+  Windows 上也可以用随包运行时：node\node.exe server.js
 
 文件说明
   index.html / assets/      编译后的页面与 JS、CSS（Vite 产物）
+  node\node.exe             随包携带的官方 Windows 版 Node（约 80 MB）
   server.js                 静态服务器（零第三方依赖，仅 Node 内置模块）
-  start.bat                 Windows 双击启动脚本（内部调用 server.js）
+  start.bat                 双击启动：优先用随包 Node，其次系统 Node
   api-target.txt            /api 的代理目标，可选，见下
-  package.json              仅用来把本目录固定为 CommonJS（删掉会让
-                            server.js 在 web/ 仓库内被当成 ES Module 而报错）
+  package.json              仅用来把本目录固定为 CommonJS，保证 server.js 正常
+                            （删掉会让它在 web/ 仓库内被当成 ES Module 而报错）
+
+体积与取舍
+  随包 Node 是为了让目标机器零安装，代价是 out 目录约 80 MB（压缩后约 30 MB）。
+  如果目标机器本来就有 Node.js 20+，可以删掉 node 目录，start.bat 会自动回退；
+  构建时也可以直接跳过：bash make.sh --no-bundle-node
+  （此时 out 只有约 200 KB）。
 
 关于后端 API（api-target.txt）
   页面登录、录入等操作需要后端 API。api-target.txt 里填一行后端地址即可：
@@ -34,7 +44,7 @@
   未填写（或整行被注释掉）时，/api 请求会返回 502，页面会提示“未配置后端 API”。
   浏览器始终只访问本机同源地址，由 server.js 转发到后端，因此后端不需要配置
   CORS；代理转发时会去掉 Origin 头，与 npm run dev 的 Vite 代理行为一致。
-  也可以在启动前设置环境变量覆盖它：set ARTSMART_API_TARGET=http://localhost:8080
+  也可以在启动前用环境变量覆盖：set ARTSMART_API_TARGET=http://localhost:8080
 
 登录页的“一键添加测试账户”
   登录页上的这个按钮仅用于开发/测试：它会调用后端注册接口创建测试账户
@@ -46,4 +56,9 @@
 
 想重新构建
   在源码目录 web/ 下执行：bash make.sh
-  （需要本机有 Node.js 与已安装的 node_modules：npm install）
+    bash make.sh --no-bundle-node            不打包 node.exe（目标机器需自带 Node）
+    bash make.sh --bundle-node               强制打包（缺网络/校验失败时直接报错）
+    bash make.sh --node-version latest-lts   打包官方当前 LTS 版本
+    bash make.sh --node-arch arm64           打包 Windows ARM64 版 node.exe
+  构建需要：Node.js + 已安装的 node_modules（npm install）。
+  下载过的 node.exe 会缓存在 web/.cache/node/，重复构建不再下载。

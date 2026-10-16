@@ -2,13 +2,19 @@
 rem ============================================================================
 rem  艺数智策 · 前端服务启动（Windows 原生，不使用 Docker / WSL）
 rem
-rem  out/ 是自包含目录：编译后的 JS、静态资源、server.js 都在这里，
-rem  目标机器只要装了 Node.js 就能双击本文件启动，不需要 npm install。
+rem  out/ 是自包含目录：编译后的 JS、静态资源、server.js，以及打包进来的
+rem  Windows 版 node.exe（out\node\node.exe）。目标机器不需要安装 Node.js、
+rem  不需要联网、不需要管理员权限，双击本文件即可。
 rem
-rem  行为：检查 Node.js → 启动静态服务（端口 8080，被占用则顺延 8081、8082 …）
-rem        → 服务就绪后自动打开浏览器；日志留在本窗口，Ctrl+C 停止。
+rem  运行时选择顺序：
+rem    1) out\node\node.exe   随包携带的官方 Node（推荐，零安装）
+rem    2) 系统 PATH 里的 node 没有随包 Node 时回退（需 Node.js 20+）
+rem
+rem  行为：端口默认 8080，被占用则自动顺延（8081、8082 …）；
+rem        服务就绪后自动打开浏览器；日志留在本窗口，Ctrl+C 停止。
 rem  后端：/api 的代理目标写在本目录 api-target.txt（可选，留空即纯静态预览）。
-rem  退出码：1 缺少 Node.js；2 缺少 server.js；3 缺少 index.html；4 服务异常退出。
+rem  退出码：1 找不到可用运行时；2 缺少 server.js；3 缺少 index.html；
+rem          4 服务异常退出。
 rem ============================================================================
 setlocal enabledelayedexpansion
 chcp 65001 >nul
@@ -21,42 +27,62 @@ echo === 艺数智策 · 前端服务启动 ===
 echo 目录：%HERE%
 echo.
 
-where node >nul 2>nul
-if errorlevel 1 (
-  echo [错误] 未检测到 Node.js。请安装 Node.js 20 或更高版本，并确保 node 已加入 PATH。
-  echo [error] Node.js not found. Install Node.js 20+ and make sure "node" is on PATH.
-  echo         下载地址：https://nodejs.org/
-  set "EXIT_CODE=1"
-  goto :finish
-)
-for /f "delims=" %%v in ('node --version 2^>nul') do set "NODE_VERSION=%%v"
-echo [环境] Node.js !NODE_VERSION!
-
-if not exist "%HERE%server.js" (
-  echo [错误] 未找到 server.js，请确认 out 目录完整（index.html、assets、server.js、start.bat）。
-  echo [error] server.js not found next to this script.
-  set "EXIT_CODE=2"
-  goto :finish
-)
 if not exist "%HERE%index.html" (
-  echo [错误] 未找到 index.html，请确认 out 目录完整（index.html、assets、server.js、start.bat）。
+  echo [错误] 未找到 index.html，请确认 out 目录完整（index.html、assets、server.js、node、start.bat）。
   echo [error] index.html not found next to this script.
   set "EXIT_CODE=3"
   goto :finish
 )
+if not exist "%HERE%server.js" (
+  echo [错误] 未找到 server.js，请确认 out 目录完整（index.html、assets、server.js、node、start.bat）。
+  echo [error] server.js not found next to this script.
+  set "EXIT_CODE=2"
+  goto :finish
+)
 
-echo [启动] 正在启动本地服务：默认端口 8080，被占用时自动顺延。
-echo [提示] 服务就绪后会自动打开浏览器；停止服务请按 Ctrl+C。
+if exist "%HERE%node\node.exe" (
+  for /f "delims=" %%v in ('"%HERE%node\node.exe" --version 2^>nul') do set "NODE_VERSION=%%v"
+  if not defined NODE_VERSION set "NODE_VERSION=（版本读取失败）"
+  set "LAUNCHER=随包 Node.js !NODE_VERSION! + server.js（无需安装 Node.js）"
+  set "RUN_NODE=%HERE%node\node.exe"
+  set "RUN_JS=%HERE%server.js"
+  goto :launch
+)
+
+where node >nul 2>nul
+if errorlevel 1 (
+  echo [错误] 未找到随包 Node（out\node\node.exe），系统也没有 Node.js，无法启动。
+  echo [error] Neither the bundled Node (out\node\node.exe) nor a system Node.js was found.
+  echo         解决办法：在源码目录重新执行 bash make.sh 生成随包 Node；
+  echo                   或安装 Node.js 20+（https://nodejs.org/）后重试。
+  set "EXIT_CODE=1"
+  goto :finish
+)
+for /f "delims=" %%v in ('node --version 2^>nul') do set "NODE_VERSION=%%v"
+set "LAUNCHER=系统 Node.js !NODE_VERSION! + server.js"
+set "RUN_JS=%HERE%server.js"
+
+:launch
+echo [启动] 使用 %LAUNCHER%
+echo [提示] 端口默认 8080，被占用时自动顺延；服务就绪后会自动打开浏览器；停止服务请按 Ctrl+C。
 echo.
 
-node "%HERE%server.js"
-set "NODE_EXIT=!ERRORLEVEL!"
-if !NODE_EXIT! EQU 130 echo [提示] 已收到 Ctrl+C，服务停止。
-if !NODE_EXIT! GEQ 1 if !NODE_EXIT! NEQ 130 (
-  echo.
-  echo [错误] 服务未正常退出（退出码 !NODE_EXIT!），原因见上面的日志。
-  echo [error] The server exited with code !NODE_EXIT!. See the log above.
-  set "EXIT_CODE=4"
+if defined RUN_NODE (
+  "!RUN_NODE!" "!RUN_JS!"
+) else (
+  node "!RUN_JS!"
+)
+
+set "SERVER_EXIT=!ERRORLEVEL!"
+if !SERVER_EXIT! NEQ 0 (
+  if !SERVER_EXIT! EQU 130 (
+    echo [提示] 已收到 Ctrl+C，服务停止。
+  ) else (
+    echo.
+    echo [错误] 服务未正常退出（退出码 !SERVER_EXIT!），原因见上面的日志。
+    echo [error] The server exited with code !SERVER_EXIT!. See the log above.
+    set "EXIT_CODE=4"
+  )
 )
 
 :finish

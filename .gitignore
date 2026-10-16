@@ -10,3 +10,4 @@ build/
 *.csv
 NextVersion
 web/out/
+web/.cache/
